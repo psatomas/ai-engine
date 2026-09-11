@@ -1,0 +1,21 @@
+{
+  "name": "@ai-engine/providers",
+  "version": "0.1.0",
+  "description": "Provider adapters (Codex CLI, Claude Code CLI) implementing the core ProviderAdapter port.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "scripts": {
+    "build": "tsc -b tsconfig.json",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@ai-engine/core": "^0.1.0",
+    "@ai-engine/logging": "^0.1.0",
+    "execa": "^9.5.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}
