@@ -1,0 +1,17 @@
+{
+  "name": "@ai-engine/logging",
+  "version": "0.1.0",
+  "description": "Structured, secret-redacting JSON logging for AI Engine.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "scripts": {
+    "build": "tsc -b tsconfig.json",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}
