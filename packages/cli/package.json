@@ -1,0 +1,26 @@
+{
+  "name": "@ai-engine/cli",
+  "version": "0.1.0",
+  "description": "The `ai` command-line interface for the AI Engine control plane.",
+  "type": "module",
+  "bin": {
+    "ai": "./dist/bin.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "scripts": {
+    "build": "tsc -b tsconfig.json && chmod +x dist/bin.js",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@ai-engine/core": "^0.1.0",
+    "@ai-engine/orchestrator": "^0.1.0",
+    "@ai-engine/config": "^0.1.0",
+    "@ai-engine/security": "^0.1.0",
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}

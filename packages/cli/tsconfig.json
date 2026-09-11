@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "references": [{ "path": "../core" }, { "path": "../orchestrator" }, { "path": "../config" }, { "path": "../security" }],
+  "include": ["src"]
+}
