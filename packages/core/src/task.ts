@@ -1,0 +1,100 @@
+import type { WorkflowState } from "./workflow-state.js";
+import type { VerificationReport } from "./verification.js";
+import type { ReviewReport } from "./review.js";
+
+export interface GitBaseline {
+  branch: string;
+  commit: string;
+  worktreePath?: string;
+  taskBranch?: string;
+  dirtyAtStart: boolean;
+  untrackedAtStart: string[];
+  /**
+   * The worktree commit as of the last successfully persisted TaskRecord.
+   * Refreshed on every persist(). Compared against the worktree's actual
+   * current commit at the start of every mutating step (see
+   * Orchestrator's git/task divergence detection) — a mismatch means the
+   * worktree changed since the last time we durably recorded what state we
+   * thought the task was in (e.g. a step committed but the process was
+   * killed before the resulting state was persisted), and the step refuses
+   * to silently proceed until a human acknowledges it.
+   */
+  lastKnownCommit?: string;
+}
+
+export interface TaskUsage {
+  /** Only providers that report cost (currently: Claude) contribute here — see docs/security.md#budgets. */
+  totalCostUsd?: number;
+  totalInputTokens?: number;
+  totalOutputTokens?: number;
+}
+
+export interface ApprovalRecord {
+  gate: string;
+  decision: "approved" | "rejected";
+  by: string;
+  at: string;
+  note?: string;
+}
+
+export interface FailureRecord {
+  at: string;
+  state: WorkflowState;
+  message: string;
+  code?: string;
+}
+
+export interface HistoryEvent {
+  at: string;
+  from: WorkflowState;
+  to: WorkflowState;
+  trigger: string;
+  actor: "system" | "human" | ProviderRoleActor;
+  detail?: string;
+}
+
+export interface ProviderRoleActor {
+  role: string;
+  providerId: string;
+}
+
+export interface RoleAssignment {
+  role: string;
+  providerId: string;
+}
+
+/**
+ * The persistent identity of a single unit of engineering work. This is the
+ * source of truth for workflow state — never chat history. See docs/workflow.md.
+ */
+export interface TaskRecord {
+  id: string;
+  repository: {
+    root: string;
+    remoteUrl?: string;
+  };
+  workspaceFolder: string;
+  originalRequest: string;
+  specification?: string;
+  plan?: string;
+  workflowState: WorkflowState;
+  previousState?: WorkflowState;
+  /** Name of an approval gate (e.g. "security_review") currently blocking progress while PAUSED. */
+  pendingGate?: string;
+  /** The forward trigger to apply once `pendingGate` is approved (see Orchestrator.approveGate). */
+  pendingDecisionTrigger?: string;
+  agentsUsed: RoleAssignment[];
+  git: GitBaseline;
+  verification: VerificationReport[];
+  reviews: ReviewReport[];
+  approvals: ApprovalRecord[];
+  history: HistoryEvent[];
+  failures: FailureRecord[];
+  iterationCounts: Record<string, number>;
+  createdAt: string;
+  updatedAt: string;
+  finalStatus?: "ready" | "failed" | "cancelled";
+  providerSessions: Record<string, string>;
+  usage: TaskUsage;
+  roleInvocationCounts: Record<string, number>;
+}

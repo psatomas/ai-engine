@@ -1,0 +1,19 @@
+{
+  "name": "@ai-engine/core",
+  "version": "0.1.0",
+  "description": "Provider-independent domain model and ports for the AI Engine control plane.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -b tsconfig.json",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}
