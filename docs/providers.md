@@ -167,6 +167,15 @@ wiring every invocation flows through; this real run is what actually exercised 
 subprocess/JSON-parsing layer end-to-end. If Claude Code or Codex change their `stream-json`/`--json`
 event shapes in a future release, re-running a real task like this is the fastest way to notice.
 
+**A second real end-to-end run has since happened**, against a different, disposable external
+repository, re-exercising the same pipeline after the three fixes above. It confirmed all three
+hold under a fresh task: dependency bootstrap ran `npm ci` correctly in a genuinely fresh worktree;
+the implementer and fixer both executed real Bash (build/test/lint, and installing new
+devDependencies) under the `"auto"` permission mode; and a real review round produced two genuine
+findings that `fix()` marked `fix_attempted` (never `fixed`), which a subsequent independent review
+round then confirmed resolved on its own — not by trusting the earlier mark. No new AI Engine
+defects were found on this run.
+
 ## Sandbox level → provider flag mapping
 
 | `SandboxLevel`    | Codex `-s`           | Claude tool policy                                        |

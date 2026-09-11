@@ -256,6 +256,16 @@ honest `fix_attempted` status — see `ReviewFinding.status` in `packages/core/s
 [docs/providers.md](./docs/providers.md#what-was-verified--including-since-a-real-authenticated-end-to-end-run)
 for the full account.
 
+**A second real, unmocked end-to-end run has since validated all three fixes above under a fresh
+task against a different external repository** — same pipeline, same roles, no mocking. That run's
+first review round produced two genuine, unforced findings (a lint regression and a real
+safe-integer-overflow bug); `fix()` marked both `fix_attempted`, never `fixed`; and a fresh,
+independent re-review round found nothing, reaching `READY`. No further AI Engine defects were
+found. This is now a system validated by **two** independent real end-to-end runs — not a claim of
+general production readiness beyond what those two runs actually exercised. See
+[CHANGELOG.md](./CHANGELOG.md) for the full v0.1.0 scope: what's validated, what's a known
+limitation, and what's explicitly out of scope.
+
 ## 13. Known limitations
 
 - **No automatic worktree/branch garbage collection** for cancelled/failed/old tasks — cleanup is a
