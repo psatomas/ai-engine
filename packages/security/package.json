@@ -1,0 +1,20 @@
+{
+  "name": "@ai-engine/security",
+  "version": "0.1.0",
+  "description": "Security policy engine: command/path guards, trust boundaries, per-role sandbox defaults.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "scripts": {
+    "build": "tsc -b tsconfig.json",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@ai-engine/core": "^0.1.0",
+    "@ai-engine/config": "^0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}
