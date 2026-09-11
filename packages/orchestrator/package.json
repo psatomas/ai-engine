@@ -1,0 +1,27 @@
+{
+  "name": "@ai-engine/orchestrator",
+  "version": "0.1.0",
+  "description": "Wires workflow, agents, git safety, verification, review and config into task-level operations.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "scripts": {
+    "build": "tsc -b tsconfig.json",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@ai-engine/core": "^0.1.0",
+    "@ai-engine/workflow": "^0.1.0",
+    "@ai-engine/config": "^0.1.0",
+    "@ai-engine/security": "^0.1.0",
+    "@ai-engine/git": "^0.1.0",
+    "@ai-engine/verification": "^0.1.0",
+    "@ai-engine/providers": "^0.1.0",
+    "@ai-engine/logging": "^0.1.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}

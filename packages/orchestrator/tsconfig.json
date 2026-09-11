@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "references": [
+    { "path": "../core" },
+    { "path": "../workflow" },
+    { "path": "../config" },
+    { "path": "../security" },
+    { "path": "../git" },
+    { "path": "../verification" },
+    { "path": "../providers" },
+    { "path": "../logging" }
+  ],
+  "include": ["src"]
+}
