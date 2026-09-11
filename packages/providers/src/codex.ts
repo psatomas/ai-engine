@@ -136,17 +136,28 @@ export class CodexProvider implements ProviderAdapter {
     let schemaFile: string | undefined;
 
     try {
+      // BUG FOUND BY REAL END-TO-END EXECUTION: `codex exec resume <id> -` has a materially
+      // narrower flag surface than a fresh `codex exec -` (confirmed against `codex exec resume
+      // --help` on a live install) — it does not accept `-s` (sandbox), the approval flags, `-C`
+      // (working directory), or `--add-dir` at all; passing any of them made the real CLI exit
+      // immediately with "unexpected argument '-s' found", which a retried/resumed Codex role hit
+      // on its very first real run. This was never caught by mocked-provider tests because no mock
+      // enforces the real CLI's per-subcommand argument grammar. `-C` isn't available on resume
+      // either way, so the working directory is now set via execa's own `cwd` option below
+      // instead (this also fixes a latent correctness gap: a resumed session previously had no
+      // reliable way to be pointed at the task's worktree at all).
       const args: string[] = ["exec"];
-      if (request.resumeSessionId) {
-        args.push("resume", request.resumeSessionId, "-");
+      const resuming = Boolean(request.resumeSessionId);
+      if (resuming) {
+        args.push("resume", request.resumeSessionId!, "-");
       } else {
         args.push("-");
+        args.push("-s", mapSandbox(request.sandbox));
+        args.push(...approvalFlags(request.approval));
+        args.push("-C", request.workingDirectory);
+        for (const dir of request.additionalWritableDirs ?? []) args.push("--add-dir", dir);
       }
       args.push("--json");
-      args.push("-s", mapSandbox(request.sandbox));
-      args.push(...approvalFlags(request.approval));
-      args.push("-C", request.workingDirectory);
-      for (const dir of request.additionalWritableDirs ?? []) args.push("--add-dir", dir);
       args.push("-o", lastMessageFile);
       if (request.outputSchema) {
         schemaFile = join(tmpDir, "schema.json");
@@ -177,6 +188,7 @@ export class CodexProvider implements ProviderAdapter {
 
       const subprocess = execa(binary, args, {
         input: prompt,
+        cwd: request.workingDirectory,
         reject: false,
         timeout: request.timeoutMs,
         cancelSignal: controller.signal,
