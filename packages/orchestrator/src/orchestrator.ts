@@ -454,8 +454,14 @@ export class Orchestrator {
       this.assertState(task, ["FIXING"]);
 
       const projectContext = await loadProjectContext(this.repoRoot);
+      const openFindingCount = task.reviews.flatMap((r) => r.findings).filter((f) => f.status === "open").length;
+      const instructions = `Original request:\n${task.originalRequest}\n\nAddress the failing checks and/or open review findings provided in context below. Do not make unrelated changes.${
+        openFindingCount > 1
+          ? ` There are ${openFindingCount} separate open findings listed below (numbered) — address every one of them individually, not just the first; do not stop early.`
+          : ""
+      }`;
       const request = await this.buildRequest(task, WellKnownRole.Implementer, {
-        instructions: `Original request:\n${task.originalRequest}\n\nAddress the failing checks and/or open review findings provided in context below. Do not make unrelated changes.`,
+        instructions,
         context: [...this.buildFixContext(task), ...projectContext]
       });
       const { result, providerId } = await this.invokeRole(task, WellKnownRole.Implementer, request);
@@ -467,13 +473,21 @@ export class Orchestrator {
       }
 
       await this.deps.gitRepo.commitAllIfChanged(task.git.worktreePath ?? task.workspaceFolder, `ai-engine(${task.id}): fix`);
-      // Optimistic: the implementer attempted to address every open finding. The next review/verification
-      // pass is what actually re-validates; findings are re-opened there if still present.
+      // Optimistic but honest: fix() ran and reported success, so every finding that was open
+      // when this call started is marked "fix_attempted" — NOT "fixed". That distinction is the
+      // whole point: an audit found that a single fix() call which only actually addressed one of
+      // two given findings still left the workflow claiming both were "fixed", which is a false
+      // claim of verified correctness. "fix_attempted" makes no claim about whether the
+      // implementer actually looked at any specific finding, only that a fix pass ran while it was
+      // open. The next review/verification pass is what actually re-validates: it re-examines the
+      // real diff from scratch and reports a fresh "open" finding for anything still wrong,
+      // independent of what any past finding's status says (see Orchestrator.review()) — this is
+      // what genuinely closes a finding, not this optimistic mark.
       task = {
         ...task,
         reviews: task.reviews.map((r) => ({
           ...r,
-          findings: r.findings.map((f) => (f.status === "open" ? { ...f, status: "fixed" as const } : f))
+          findings: r.findings.map((f) => (f.status === "open" ? { ...f, status: "fix_attempted" as const } : f))
         }))
       };
       task = this.deps.workflow.apply(task, "fixed", { role: WellKnownRole.Implementer, providerId }, result.finalMessage);
@@ -774,13 +788,18 @@ export class Orchestrator {
     }
     const openFindings: ReviewFinding[] = task.reviews.flatMap((r) => r.findings.filter((f) => f.status === "open"));
     if (openFindings.length > 0) {
+      // Numbered and explicitly counted so the implementer can't lose track of how many there
+      // are — an audit found a fix() pass silently addressing only one of several open findings
+      // while still reporting overall success. Numbering doesn't guarantee every one gets
+      // addressed (that's an agent-behavior question, not something this context block can force),
+      // but it removes "I didn't realize there was more than one" as a possible cause.
       blocks.push({
         trust: "agent_generated",
-        label: "open review findings",
+        label: `open review findings (${openFindings.length} total — address every one)`,
         content: openFindings
           .map(
-            (f) =>
-              `- [${f.severity}] ${f.summary}${f.file ? ` (${f.file}${f.line ? `:${f.line}` : ""})` : ""}\n${f.detail}${
+            (f, i) =>
+              `${i + 1}/${openFindings.length}. [${f.severity}] ${f.summary}${f.file ? ` (${f.file}${f.line ? `:${f.line}` : ""})` : ""}\n${f.detail}${
                 f.suggestedFix ? `\nSuggested fix: ${f.suggestedFix}` : ""
               }`
           )

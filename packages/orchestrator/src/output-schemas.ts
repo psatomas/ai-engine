@@ -12,6 +12,14 @@ import { z } from "zod";
  * corresponding zod schemas below use `.nullish()` (accepts `null` or `undefined`) transformed
  * back to `undefined`, since a strict-mode-compliant model response sends explicit `null` for an
  * absent optional field rather than omitting the key.
+ *
+ * A SECOND bug found the same way, while writing a regression test for a related finding: a real
+ * reviewer response used `"dimension": "scope"`, which the old `ReviewFindingSchema` rejected (it
+ * used a closed `z.enum(...)` here, even though the JSON schema actually sent to the provider —
+ * `ReviewJsonSchema` below — never restricted this field to begin with). One finding with an
+ * unrecognized dimension failed zod's validation for the whole `findings` array, which failed the
+ * whole response, silently discarding every real finding from that round. `dimension` is now
+ * `z.string()` — see ReviewDimension in @ai-engine/core for the full rationale.
  */
 export const ArchitectOutputSchema = z.object({
   specification: z.string(),
@@ -32,7 +40,12 @@ export const ArchitectJsonSchema = {
 };
 
 export const ReviewFindingSchema = z.object({
-  dimension: z.enum(["correctness", "architecture", "security", "invariants", "state_transitions", "testing", "maintainability"]),
+  // Deliberately z.string(), not a closed z.enum(...) — see ReviewDimension in @ai-engine/core for
+  // why: a real reviewer invocation used "scope", which an earlier closed enum here rejected,
+  // silently discarding that entire round's findings (one bad enum value fails the whole array).
+  // The JSON schema actually sent to the provider (ReviewJsonSchema below) was already a plain
+  // string for this field — only this parse-side schema was stricter than what was requested.
+  dimension: z.string(),
   severity: z.enum(["blocker", "major", "minor", "nit"]),
   file: z
     .string()

@@ -465,6 +465,147 @@ describe("Empty repository is handled with a clear error, not a raw git failure"
   });
 });
 
+/**
+ * Regression coverage for a real end-to-end finding: a fix() pass that only actually addressed
+ * one of two open findings still left the workflow record claiming both were resolved, because
+ * the old behavior unconditionally marked every then-open finding "fixed" once fix() reported
+ * overall success. The record should never claim more certainty than the system actually has —
+ * see the doc comment on Orchestrator.fix() and ReviewFinding.status in @ai-engine/core.
+ */
+describe("Fix finding-state integrity", () => {
+  it('fix() marks findings that were open "fix_attempted", never "fixed" — "fixed" is not a claim this system can make', async () => {
+    const provider = new MockProvider("mock", (request) => {
+      if (request.role === "reviewer") {
+        return {
+          status: "success",
+          structuredOutput: {
+            verdict: "changes_requested",
+            summary: "needs work",
+            findings: [{ dimension: "correctness", severity: "major", summary: "bug", detail: "detail" }]
+          }
+        };
+      }
+      return mockResponder(request);
+    });
+    const orchestrator = await buildOrchestrator({
+      provider,
+      configOverrides: { approvals: GlobalConfigSchema.shape.approvals.parse({ plan: true, security_review: false, final_merge: true }) }
+    });
+
+    let task = await orchestrator.createTask("Add a feature");
+    task = await orchestrator.run(task.id);
+    task = await orchestrator.decidePlan(task.id, "approved", "alice");
+    task = await orchestrator.implement(task.id);
+    task = await orchestrator.test(task.id);
+    task = await orchestrator.review(task.id);
+    expect(task.workflowState).toBe("FIXING");
+
+    task = await orchestrator.fix(task.id);
+
+    const findingStatuses = task.reviews.flatMap((r) => r.findings).map((f) => f.status);
+    expect(findingStatuses).toContain("fix_attempted");
+    expect(findingStatuses).not.toContain("fixed");
+  });
+
+  it("numbers every open finding and tells the implementer explicitly to address all of them, not just the first", async () => {
+    const provider = new MockProvider("mock", (request) => {
+      if (request.role === "reviewer") {
+        return {
+          status: "success",
+          structuredOutput: {
+            verdict: "changes_requested",
+            summary: "two issues",
+            findings: [
+              { dimension: "correctness", severity: "major", summary: "FINDING_ONE", detail: "first issue" },
+              { dimension: "scope", severity: "major", summary: "FINDING_TWO", detail: "second issue" }
+            ]
+          }
+        };
+      }
+      return mockResponder(request);
+    });
+    const orchestrator = await buildOrchestrator({
+      provider,
+      configOverrides: { approvals: GlobalConfigSchema.shape.approvals.parse({ plan: true, security_review: false, final_merge: true }) }
+    });
+
+    let task = await orchestrator.createTask("Add a feature");
+    task = await orchestrator.run(task.id);
+    task = await orchestrator.decidePlan(task.id, "approved", "alice");
+    task = await orchestrator.implement(task.id);
+    task = await orchestrator.test(task.id);
+    task = await orchestrator.review(task.id);
+    expect(task.workflowState).toBe("FIXING");
+
+    await orchestrator.fix(task.id);
+
+    const fixCall = provider.invocations.filter((i) => i.role === "implementer").at(-1)!;
+    expect(fixCall.request.instructions).toMatch(/2 separate open findings/);
+    const findingsBlock = fixCall.request.context.find((b) => b.content.includes("FINDING_ONE"));
+    expect(findingsBlock?.label).toMatch(/2 total/);
+    expect(findingsBlock?.content).toContain("1/2.");
+    expect(findingsBlock?.content).toContain("2/2.");
+  });
+
+  /**
+   * The actual real-world scenario, reproduced end-to-end: fix() runs and optimistically marks a
+   * finding "fix_attempted" even though the implementer here does not really address it (the mock
+   * makes no change related to the finding, matching what a real agent that silently skips a
+   * finding looks like from the workflow's perspective). The genuine safety net is the next review
+   * round: it re-examines the situation from scratch and reports a fresh "open" finding for the
+   * same underlying issue, completely independent of the stale "fix_attempted" mark on the old
+   * finding object — and that fresh "open" finding, not the old record, is what
+   * hasBlockingOpenFindings actually gates on. This is what a real Codex review pass did in
+   * practice when a Claude fix() pass left a finding unaddressed.
+   */
+  it("a finding left unaddressed by fix() is independently re-caught as a fresh open finding by the next review round", async () => {
+    let reviewRound = 0;
+    const provider = new MockProvider("mock", (request) => {
+      if (request.role === "reviewer") {
+        reviewRound++;
+        // Both rounds report the exact same unresolved issue — simulating a fix() pass that
+        // didn't actually change anything relevant.
+        return {
+          status: "success",
+          structuredOutput: {
+            verdict: "changes_requested",
+            summary: `round ${reviewRound}`,
+            findings: [{ dimension: "correctness", severity: "major", summary: "STILL_BROKEN", detail: "still not fixed" }]
+          }
+        };
+      }
+      if (request.role === "security_reviewer") {
+        return { status: "success", structuredOutput: { verdict: "approved", summary: "no security concerns", findings: [] } };
+      }
+      return mockResponder(request);
+    });
+    const orchestrator = await buildOrchestrator({
+      provider,
+      configOverrides: { approvals: GlobalConfigSchema.shape.approvals.parse({ plan: true, security_review: false, final_merge: true }) }
+    });
+
+    let task = await orchestrator.createTask("Add a feature");
+    task = await orchestrator.run(task.id);
+    task = await orchestrator.decidePlan(task.id, "approved", "alice");
+    task = await orchestrator.implement(task.id);
+    task = await orchestrator.test(task.id);
+
+    task = await orchestrator.review(task.id); // round 1: reviewer reports STILL_BROKEN (open)
+    expect(task.workflowState).toBe("FIXING");
+    task = await orchestrator.fix(task.id); // marks it fix_attempted; does not really fix anything
+    task = await orchestrator.test(task.id);
+    task = await orchestrator.review(task.id); // round 2: reviewer reports STILL_BROKEN again, fresh
+
+    // Still blocked — the second round's fresh finding is what matters, not the first round's
+    // now-stale "fix_attempted" one. (task.reviews interleaves reviewer/security_reviewer reports
+    // in call order, so pick the reviewer role's latest report specifically rather than assuming
+    // it's last.)
+    expect(task.workflowState).toBe("FIXING");
+    const secondRoundFindings = task.reviews.filter((r) => r.role === "reviewer").at(-1)!.findings;
+    expect(secondRoundFindings.some((f) => f.summary === "STILL_BROKEN" && f.status === "open")).toBe(true);
+  });
+});
+
 describe("checkPath is genuinely wired into request building", () => {
   it("refuses to build a request when the worktree path has been replaced by a symlink escaping known roots", async () => {
     const orchestrator = await buildOrchestrator();

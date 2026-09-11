@@ -192,7 +192,10 @@ describe("Orchestrator end-to-end (mock providers, real git + workflow)", () => 
     expect(task.workflowState).toBe("READY");
     expect(task.reviews.length).toBeGreaterThanOrEqual(3); // first reviewer(changes) + security_reviewer(approved) + second round
     const firstFindings = task.reviews[0]!.findings;
-    expect(firstFindings[0]?.status).toBe("fixed");
+    // "fix_attempted", not "fixed" — fix() ran while this was open and reported success, but that
+    // is a claim, not independent confirmation. See orchestrator.hardening.test.ts's dedicated
+    // "fix finding-state integrity" tests for the full regression coverage.
+    expect(firstFindings[0]?.status).toBe("fix_attempted");
   });
 
   it("throws IllegalTaskStateError when a step is called out of order", async () => {
