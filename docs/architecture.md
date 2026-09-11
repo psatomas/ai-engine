@@ -99,6 +99,23 @@ Consequences:
   [Human control & the final_merge gate](./security.md#approval-gates).
 - Cancelling or failing a task leaves its worktree and branch in place for forensic inspection; there
   is no automatic garbage collection in this version (see [Known limitations](../README.md#known-limitations)).
+- Right after creating the worktree, `createTask()` makes a single best-effort attempt to install
+  the target project's dependencies into it (`prepareWorktreeDependencies`,
+  `packages/orchestrator/src/dependency-setup.ts`) — a real end-to-end run found that a fresh
+  `git worktree` only checks out tracked files, so a Node project's `node_modules` never exists in
+  a new one, and verification fails immediately with something like `tsc: command not found`. This
+  is deliberately narrow, not a package-management framework: it detects the package manager from
+  whichever lockfile is present (`package-lock.json` / `yarn.lock` / `pnpm-lock.yaml` /
+  `bun.lockb`) and runs only that manager's frozen/reproducible install variant (`npm ci`, never
+  `npm install`) — never anything read from the repository itself. It also refuses to run at all
+  unless `node_modules` is confirmed covered by the repository's own `.gitignore` (checked live via
+  `git check-ignore`), specifically so an install can never leave something `commitAllIfChanged()`
+  later sweeps into a task commit — which is exactly what happened during that same end-to-end run,
+  when a manual `npm install` (before this mechanism existed) left a stray `package-lock.json` diff
+  that got committed as part of an unrelated fix step. Never blocks task creation: an install
+  failure or a project this doesn't recognize is recorded on the task
+  (`dependencySetup`, visible via `ai status <taskId>`) and verification simply fails normally, now
+  with a clearer upfront reason instead of a confusing downstream "command not found".
 
 ## Task pipeline (default workflow)
 

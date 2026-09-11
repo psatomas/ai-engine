@@ -102,6 +102,14 @@ explicit approval" tests (which prove, via a command that touches a marker file,
 command genuinely never runs) and `orchestrator.hardening.test.ts`'s "C1" end-to-end test (drives a
 task through `TESTING` → blocked as `NOT_APPROVED` → `ai approve-check` → passes → `READY`).
 
+The one-time dependency-install attempt made when a task's worktree is created
+(`prepareWorktreeDependencies`, see [architecture.md](./architecture.md#git-worktree-behavior))
+sits in the same trust category as `auto_detected` checks, for the same reason: the command that
+runs is always one of four fixed, hardcoded package-manager install commands AI Engine chooses
+itself from which lockfile is present, never anything read from the repository — so it does not go
+through `CommandApprovalStore` either, but it is still checked against the security policy's
+command deny-list first, for defense-in-depth.
+
 ## Command & path guards (`@ai-engine/security`)
 
 `SecurityPolicy` (`packages/security/src/policy.ts`) is defense-in-depth for commands a provider's own
@@ -262,9 +270,17 @@ auth login`) and storage (`~/.codex`, `~/.claude/.credentials.json`) — AI Engi
   host privileges and no sandboxing beyond `cwd` — this is the same trust a developer already extends by
   running `npm test` themselves, and is out of scope for the approval gate (which targets the
   _additional_, repository-freeform command surface AI Engine itself introduces).
-- **Claude Code's headless permission-mode behavior for read-only roles has not been exercised against
-  a live invocation** (no billed call was made while building or hardening this system — see
-  [providers.md](./providers.md)). The read-only enforcement itself (`--tools Read,Grep,Glob`, excluding
-  Edit/Write/Bash entirely) is a mechanical guarantee that does not depend on this; `--permission-mode`
-  is set to `acceptEdits` uniformly rather than the interactive-oriented `plan` mode specifically to
-  avoid depending on unverified headless behavior for anything that matters.
+- **Claude Code's headless permission-mode behavior has since been exercised against real, live
+  invocations** — both during a real end-to-end task run and in dedicated testing across all six
+  documented `--permission-mode` values on the actual installed CLI (see
+  [providers.md](./providers.md)). That testing is _why_ `--permission-mode` is `auto`, not the
+  previously assumed `acceptEdits` (which turned out not to cover Bash execution at all in headless
+  mode) and not `bypassPermissions` (which works too, but throws away Claude Code's own internal
+  safety classifier for no capability this workflow needs). Read-only role enforcement itself
+  (`--tools Read,Grep,Glob`, excluding Edit/Write/Bash entirely) remains a mechanical guarantee that
+  doesn't depend on permission mode at all — it's inert for read-only roles either way. What
+  permission mode does **not** provide, confirmed directly: any additional path confinement once
+  Bash is allowed — a Bash command can write outside the working directory under `auto` just as it
+  can under `bypassPermissions`. That was never permission-mode's job; the real boundary for a
+  workspace_write role remains the dedicated task worktree plus this engine's own reactive
+  command-deny-list monitor (`SecurityPolicy.evaluateEvent`), both unaffected by this choice.

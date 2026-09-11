@@ -191,8 +191,8 @@ structured `PASS | FAIL | SKIPPED | NOT_CONFIGURED`; a task cannot reach `READY`
 ## 12. Testing results
 
 ```
-Test Files  15 passed (15)
-     Tests  122 passed (122)
+Test Files  17 passed (17)
+     Tests  140 passed (140)
 ```
 
 A first independent audit found, and a hardening pass fixed — each with a regression test: repository-controlled arbitrary command execution in verification (now gated by explicit, hash-pinned approval —
@@ -234,18 +234,30 @@ folder targeting) run under a minimal `vscode`-module mock.
 
 Run it yourself: `npm install && npm run typecheck && npm test`.
 
+**A real, authenticated end-to-end run has since happened, and it found real bugs.** With both CLIs
+authenticated and the user's explicit go-ahead, a real task ran through this exact pipeline — Codex
+as architect/reviewer/security_reviewer/verifier, Claude Code as implementer/fixer — against a
+separate real repository, driven only through `ai <command>`, no mocking. It failed twice on the
+very first run: `codex exec --output-schema` rejected AI Engine's hand-written JSON schemas
+(OpenAI's Structured Outputs strict mode requires `additionalProperties: false` everywhere, which
+this project had never actually sent to a live endpoint before), and retrying a failed Codex role
+crashed outright because `codex exec resume` doesn't accept the same flags as a fresh `codex exec`.
+Both were genuine, previously-unexercised defects, both now fixed with tests. Once fixed, the
+pipeline completed for real: a genuine correctness bug in the implementer's output (a regex that
+incorrectly matched a trailing newline) was caught by Codex's review, and fixed by Claude, and the
+task reached `READY`. That run also found — and this repository then fixed — that a fresh git
+worktree has no installed dependencies (verification failed with `tsc: command not found` until
+addressed; see `prepareWorktreeDependencies` in [docs/architecture.md](./docs/architecture.md#git-worktree-behavior)),
+that Claude Code's `acceptEdits` permission mode does not actually authorize headless Bash execution
+the way this project had assumed (now `auto`, verified against the real CLI across all six
+documented permission modes — see [docs/providers.md](./docs/providers.md)), and that a `fix()` pass
+could optimistically mark a finding "fixed" without actually having addressed it (now a distinct,
+honest `fix_attempted` status — see `ReviewFinding.status` in `packages/core/src/review.ts`). See
+[docs/providers.md](./docs/providers.md#what-was-verified--including-since-a-real-authenticated-end-to-end-run)
+for the full account.
+
 ## 13. Known limitations
 
-- **No real authenticated provider call was made while building this system.** Codex is
-  unauthenticated on this machine (verified via `codex login status`, cost-free); Claude Code is
-  authenticated (Pro subscription) and was deliberately never sent a real prompt, to avoid consuming
-  the user's quota without being asked. The provider adapters' subprocess plumbing is validated
-  against real (credential-free) CLI behavior; their JSON event parsing is implemented defensively
-  (unrecognized shapes degrade to a generic event rather than crashing) but not exercised end-to-end
-  against a live completion. In particular, Claude's headless permission-mode behavior for read-only
-  roles is unverified — `acceptEdits` is used uniformly (rather than the interactive-oriented `plan`
-  mode) specifically so read-only enforcement doesn't depend on that unverified behavior; it comes from
-  tool-list restriction instead. See [docs/providers.md](./docs/providers.md#what-was-verified-without-spending-api-quota).
 - **No automatic worktree/branch garbage collection** for cancelled/failed/old tasks — cleanup is a
   manual `git worktree remove` today (documented in
   [docs/troubleshooting.md](./docs/troubleshooting.md)).
@@ -265,7 +277,7 @@ Run it yourself: `npm install && npm run typecheck && npm test`.
   useful coverage of the decision logic, but not a substitute for manual verification of actual VS Code
   UI behavior (tree views, command palette). See [docs/vscode.md](./docs/vscode.md).
 - **Only Codex and Claude Code are implemented.** Adding a third provider is intentionally small —
-  see [§14](#14-how-to-add-a-future-provider-eg-gemini).
+  see [§15](#15-how-to-add-a-future-provider-eg-gemini).
 - **The verification-command approval UI doesn't show `cwd`.** A second independent audit found that
   `ai checks`/the VS Code approval prompt display a repository-configured check's `command` but not
   its `cwd`, which is unvalidated and can be set to anywhere on disk — a reviewer approving based on
@@ -286,7 +298,7 @@ Run it yourself: `npm install && npm run typecheck && npm test`.
 ```sh
 npm install
 npm run build
-npm test              # optional but recommended: 122 tests, ~6s
+npm test              # optional but recommended: 140 tests, ~7s
 
 # Install the `ai` CLI for your user (no root needed):
 mkdir -p ~/.local/bin
