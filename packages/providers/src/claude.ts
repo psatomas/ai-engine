@@ -32,10 +32,10 @@ const CAPABILITIES: Capability[] = [
 
 /**
  * Claude Code has no notion of a disk sandbox level of its own; read-only
- * roles are enforced by restricting the tool set (no Edit/Write/Bash-write)
+ * roles are enforced by restricting the tool set (no Edit/Write/Bash)
  * rather than an OS-level flag. workspace_write roles get the default tool
- * set plus --permission-mode acceptEdits so file edits don't block on a
- * prompt nobody is present to answer.
+ * set; see permissionModeForSandbox below for how their Bash access is
+ * actually authorized headlessly.
  */
 function toolsForSandbox(level: SandboxLevel): string[] | undefined {
   if (level === "read_only") return ["Read", "Grep", "Glob"];
@@ -43,26 +43,73 @@ function toolsForSandbox(level: SandboxLevel): string[] | undefined {
 }
 
 /**
- * Every role uses "acceptEdits" (auto-accept file-edit prompts; nothing
- * else needs an interactive answer with --permission-prompts none already
- * set). A read-only role's actual enforcement comes entirely from
- * `toolsForSandbox` excluding Edit/Write/Bash — "acceptEdits" is then
- * inert for it (there is nothing left in its tool set that mode would ever
- * apply to).
+ * BUG FOUND BY REAL END-TO-END EXECUTION: this used to return "acceptEdits" for every role,
+ * on the assumption (stated in the previous version of this comment, never actually verified
+ * against a live invocation) that "acceptEdits" plus --permission-prompts none was sufficient
+ * for full headless operation. A real fixer run proved that wrong: Read/Edit worked, but a
+ * Bash call was auto-denied ("no approval surface in this session").
  *
- * This deliberately does NOT use Claude Code's "plan" permission mode for
- * read-only roles, even though it reads as a natural fit. Per the hardening
- * audit ("verify Claude headless plan-mode behavior rather than assuming it
- * works"): plan mode is designed around an interactive human confirming a
- * plan before execution, and its exact behavior under `-p
- * --output-format stream-json` (headless, nobody present to confirm) was
- * never exercised against a live invocation — see docs/providers.md. Tool
- * restriction is a mechanical guarantee that doesn't depend on that
- * unverified behavior, so it — not permission mode — is the real boundary
- * here.
+ * Real testing against this exact CLI build (claude-code 2.1.268, every one of the six documented
+ * `--permission-mode` values: acceptEdits, auto, bypassPermissions, manual, dontAsk, plan) found:
+ *   - "acceptEdits" only ever auto-accepts Edit/Write prompts. A *simple* Bash command (cat, a
+ *     plain `echo >file`) turned out to pass too, but the actual real-world failure —
+ *     `npm run <script> 2>&1 | tail -N` — was denied outright: Claude Code's own internal
+ *     command-risk classifier treats "run an arbitrary package.json script" as a distinct,
+ *     higher-risk category that "acceptEdits" does not cover, and with nobody present to answer
+ *     the resulting prompt (--permission-prompts none), it fails closed.
+ *   - "dontAsk" and "manual" denied Bash/Write outright in this headless setup — not viable here.
+ *   - "auto" and "bypassPermissions" both let the same npm-script Bash call through successfully.
+ *   - The difference between them: "auto" keeps Claude Code's own internal safety classifier
+ *     active as an additional, best-effort layer (observed firsthand: it declined an
+ *     agent-spawning action mid-test with a specific, named reason) — "bypassPermissions" skips
+ *     that layer entirely, for no additional capability this workflow needs.
+ *   - Neither mode adds real path confinement once Bash is allowed at all: a Bash command can
+ *     write outside the working directory regardless of "auto" vs "bypassPermissions" (verified
+ *     directly — an explicit absolute-path write outside the project directory succeeded under
+ *     both). That is not a new gap this change introduces: it is the same "provider sandbox is
+ *     the real boundary, this engine cannot enforce one from outside the provider process"
+ *     limitation already documented in @ai-engine/security's SecurityPolicy — permission mode was
+ *     never going to be that boundary either way. What actually still applies regardless of this
+ *     choice: the dedicated git worktree Claude is invoked in, this engine's own reactive
+ *     command-deny-list monitor (SecurityPolicy.evaluateEvent, checked against every event this
+ *     adapter emits), and — for read-only roles — `toolsForSandbox` excluding Bash from the tool
+ *     set entirely, independent of permission mode.
+ *
+ * So: "auto" for workspace_write/full_access roles (implementer, fixer) — the smallest change
+ * that makes headless Bash actually work, while keeping Claude Code's own classifier as an extra
+ * layer "bypassPermissions" would throw away for nothing gained. "read_only" roles keep whatever
+ * mode is set here too, but it is inert for them either way: `toolsForSandbox` already excludes
+ * Bash/Edit/Write from their tool set, so no permission mode grants them anything.
  */
 function permissionModeForSandbox(_level: SandboxLevel): string {
-  return "acceptEdits";
+  return "auto";
+}
+
+/**
+ * Pure and exported specifically so the invocation configuration itself (permission mode, tool
+ * restriction, headless flags) can be asserted against directly in a unit test without spawning
+ * the real CLI — see claude.test.ts. Kept free of any I/O.
+ */
+export function buildInvocationArgs(
+  request: AgentInvocationRequest,
+  options: Pick<ClaudeAdapterOptions, "denyNetworkTools" | "extraArgs" | "defaultModel">,
+  sessionId: string
+): string[] {
+  const args: string[] = ["-p", "--output-format", "stream-json", "--verbose"];
+  args.push("--permission-mode", permissionModeForSandbox(request.sandbox));
+  args.push("--permission-prompts", "none"); // headless: nobody is present to answer a prompt
+  const tools = toolsForSandbox(request.sandbox);
+  if (tools) args.push("--tools", tools.join(","));
+  if (options.denyNetworkTools) args.push("--disallowedTools", "WebFetch,WebSearch");
+  for (const dir of request.additionalWritableDirs ?? []) args.push("--add-dir", dir);
+  if (request.systemPrompt.trim()) args.push("--append-system-prompt", request.systemPrompt.trim());
+  if (request.resumeSessionId) args.push("--resume", request.resumeSessionId);
+  else args.push("--session-id", sessionId);
+  if (request.maxCostUsd) args.push("--max-budget-usd", String(request.maxCostUsd));
+  if (request.outputSchema) args.push("--json-schema", JSON.stringify(request.outputSchema));
+  if (options.defaultModel) args.push("--model", options.defaultModel);
+  args.push(...(options.extraArgs ?? []));
+  return args;
 }
 
 export interface ClaudeAdapterOptions {
@@ -157,23 +204,7 @@ export class ClaudeProvider implements ProviderAdapter {
   ): Promise<AgentResult> {
     const binary = await this.resolveBinary();
     const sessionId = request.resumeSessionId ?? randomUUID();
-
-    const args: string[] = ["-p", "--output-format", "stream-json", "--verbose"];
-    args.push("--permission-mode", permissionModeForSandbox(request.sandbox));
-    args.push("--permission-prompts", "none"); // headless: nobody is present to answer a prompt
-    const tools = toolsForSandbox(request.sandbox);
-    if (tools) args.push("--tools", tools.join(","));
-    if (this.options.denyNetworkTools) args.push("--disallowedTools", "WebFetch,WebSearch");
-    for (const dir of request.additionalWritableDirs ?? []) args.push("--add-dir", dir);
-    if (request.systemPrompt.trim()) args.push("--append-system-prompt", request.systemPrompt.trim());
-    if (request.resumeSessionId) args.push("--resume", request.resumeSessionId);
-    else args.push("--session-id", sessionId);
-    if (request.maxCostUsd) args.push("--max-budget-usd", String(request.maxCostUsd));
-    if (request.outputSchema) args.push("--json-schema", JSON.stringify(request.outputSchema));
-    const model = this.options.defaultModel;
-    if (model) args.push("--model", model);
-    args.push(...(this.options.extraArgs ?? []));
-
+    const args = buildInvocationArgs(request, this.options, sessionId);
     const prompt = composeUserPrompt(request);
 
     queue.push({ type: "lifecycle", phase: "started", at: new Date().toISOString() });
