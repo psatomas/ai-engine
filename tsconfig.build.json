@@ -1,0 +1,15 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/core" },
+    { "path": "packages/logging" },
+    { "path": "packages/config" },
+    { "path": "packages/workflow" },
+    { "path": "packages/security" },
+    { "path": "packages/git" },
+    { "path": "packages/verification" },
+    { "path": "packages/providers" },
+    { "path": "packages/orchestrator" },
+    { "path": "packages/cli" }
+  ]
+}
