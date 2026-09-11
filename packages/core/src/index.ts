@@ -5,3 +5,4 @@ export * from "./workflow-state.js";
 export * from "./verification.js";
 export * from "./review.js";
 export * from "./task.js";
+export * from "./dependency-setup.js";

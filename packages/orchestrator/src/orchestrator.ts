@@ -33,6 +33,7 @@ import { systemPromptForRole } from "./prompts.js";
 import { loadProjectContext } from "./project-context.js";
 import { writeTaskSummary } from "./task-summary.js";
 import { ArchitectJsonSchema, ReviewJsonSchema, tryParseArchitectOutput, tryParseReviewOutput } from "./output-schemas.js";
+import { prepareWorktreeDependencies } from "./dependency-setup.js";
 
 const DIFF_CONTEXT_MAX_CHARS = 40_000;
 
@@ -197,6 +198,13 @@ export class Orchestrator {
       baseline.taskBranch = branch;
       baseline.lastKnownCommit = baseline.commit;
 
+      // Best-effort, never blocks task creation: a fresh git worktree only checks out tracked
+      // files, so a Node project's node_modules never exists yet. See dependency-setup.ts for
+      // why this is intentionally narrow (fixed install commands only, never anything from the
+      // repository) and docs/architecture.md for the incident this fixes.
+      const dependencySetup = await prepareWorktreeDependencies(path, { securityPolicy: this.deps.securityPolicy });
+      this.deps.logger.info("dependency_setup", { taskId: id, ...dependencySetup });
+
       const now = new Date().toISOString();
       const seed: TaskRecord = {
         id,
@@ -205,6 +213,7 @@ export class Orchestrator {
         originalRequest,
         workflowState: "IDLE",
         agentsUsed: [],
+        dependencySetup,
         git: baseline,
         verification: [],
         reviews: [],

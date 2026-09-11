@@ -1,6 +1,7 @@
 import type { WorkflowState } from "./workflow-state.js";
 import type { VerificationReport } from "./verification.js";
 import type { ReviewReport } from "./review.js";
+import type { DependencySetupResult } from "./dependency-setup.js";
 
 export interface GitBaseline {
   branch: string;
@@ -84,6 +85,8 @@ export interface TaskRecord {
   /** The forward trigger to apply once `pendingGate` is approved (see Orchestrator.approveGate). */
   pendingDecisionTrigger?: string;
   agentsUsed: RoleAssignment[];
+  /** Result of the one-time best-effort dependency install attempted when the worktree was created — see @ai-engine/core's DependencySetupResult. Undefined for tasks created before this existed. */
+  dependencySetup?: DependencySetupResult;
   git: GitBaseline;
   verification: VerificationReport[];
   reviews: ReviewReport[];

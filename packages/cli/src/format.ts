@@ -18,6 +18,14 @@ export function formatTaskDetail(task: TaskRecord): string {
   if (task.agentsUsed.length) {
     lines.push(`Agents used: ${task.agentsUsed.map((a) => `${a.role}=${a.providerId}`).join(", ")}`);
   }
+  // Not shown when there's simply no package.json (the common case for non-Node repos) — only
+  // when there was something a Node-project operator would actually want to know about.
+  if (task.dependencySetup && task.dependencySetup.reason !== "no package.json in the repository root") {
+    const d = task.dependencySetup;
+    lines.push(
+      `Dependencies: ${d.status}${d.packageManager ? ` (${d.packageManager}: ${d.command})` : ""}${d.reason ? ` — ${d.reason}` : ""}`
+    );
+  }
   if (task.verification.length) {
     lines.push("", "Latest verification:");
     for (const r of task.verification.at(-1)!.results)
