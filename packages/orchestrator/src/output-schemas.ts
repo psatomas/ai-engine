@@ -1,5 +1,18 @@
 import { z } from "zod";
 
+/**
+ * BUG FOUND BY REAL END-TO-END EXECUTION (not a mock/unit test): the first live run of the
+ * architect role against the actual authenticated Codex CLI failed outright —
+ * `codex exec --output-schema` forwards this schema to OpenAI's Structured Outputs API in strict
+ * mode, which rejects any `type: "object"` node that doesn't explicitly set
+ * `additionalProperties: false`, and requires every property to appear in `required` (optional
+ * fields must be expressed as a nullable type union, e.g. `["string", "null"]`, not simply
+ * omitted). Neither of these hand-written schemas had ever been exercised against a real,
+ * authenticated Codex invocation before, so this was never caught by mocked-provider tests. The
+ * corresponding zod schemas below use `.nullish()` (accepts `null` or `undefined`) transformed
+ * back to `undefined`, since a strict-mode-compliant model response sends explicit `null` for an
+ * absent optional field rather than omitting the key.
+ */
 export const ArchitectOutputSchema = z.object({
   specification: z.string(),
   plan: z.string(),
@@ -14,17 +27,28 @@ export const ArchitectJsonSchema = {
     plan: { type: "string" },
     risks: { type: "array", items: { type: "string" } }
   },
-  required: ["specification", "plan"]
+  required: ["specification", "plan", "risks"],
+  additionalProperties: false
 };
 
 export const ReviewFindingSchema = z.object({
   dimension: z.enum(["correctness", "architecture", "security", "invariants", "state_transitions", "testing", "maintainability"]),
   severity: z.enum(["blocker", "major", "minor", "nit"]),
-  file: z.string().optional(),
-  line: z.number().int().optional(),
+  file: z
+    .string()
+    .nullish()
+    .transform((v) => v ?? undefined),
+  line: z
+    .number()
+    .int()
+    .nullish()
+    .transform((v) => v ?? undefined),
   summary: z.string(),
   detail: z.string(),
-  suggestedFix: z.string().optional()
+  suggestedFix: z
+    .string()
+    .nullish()
+    .transform((v) => v ?? undefined)
 });
 
 export const ReviewOutputSchema = z.object({
@@ -46,17 +70,19 @@ export const ReviewJsonSchema = {
         properties: {
           dimension: { type: "string" },
           severity: { type: "string", enum: ["blocker", "major", "minor", "nit"] },
-          file: { type: "string" },
-          line: { type: "number" },
+          file: { type: ["string", "null"] },
+          line: { type: ["number", "null"] },
           summary: { type: "string" },
           detail: { type: "string" },
-          suggestedFix: { type: "string" }
+          suggestedFix: { type: ["string", "null"] }
         },
-        required: ["dimension", "severity", "summary", "detail"]
+        required: ["dimension", "severity", "file", "line", "summary", "detail", "suggestedFix"],
+        additionalProperties: false
       }
     }
   },
-  required: ["verdict", "summary"]
+  required: ["verdict", "summary", "findings"],
+  additionalProperties: false
 };
 
 /**
