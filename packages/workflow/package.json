@@ -1,0 +1,19 @@
+{
+  "name": "@ai-engine/workflow",
+  "version": "0.1.0",
+  "description": "Explicit, persisted, resumable workflow state machine for AI Engine tasks.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "scripts": {
+    "build": "tsc -b tsconfig.json",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@ai-engine/core": "^0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}
