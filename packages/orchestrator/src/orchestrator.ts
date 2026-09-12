@@ -322,7 +322,8 @@ export class Orchestrator {
       const report = await runVerification(task.id, allChecks, notConfigured, {
         skip: disabledIds,
         approvals: this.deps.commandApprovalStore,
-        denylist: this.deps.securityPolicy
+        denylist: this.deps.securityPolicy,
+        repoRoot: cwd
       });
 
       task = { ...task, verification: [...task.verification, report] };
@@ -506,7 +507,8 @@ export class Orchestrator {
       const report = await runVerification(task.id, allChecks, notConfigured, {
         skip: disabledIds,
         approvals: this.deps.commandApprovalStore,
-        denylist: this.deps.securityPolicy
+        denylist: this.deps.securityPolicy,
+        repoRoot: cwd
       });
       task = { ...task, verification: [...task.verification, report] };
       task = await this.persist(task); // durable even if the verifier role call below fails
