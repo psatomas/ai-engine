@@ -4,6 +4,8 @@ import { redact } from "./redact.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
+const LEVEL_ORDER: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
+
 export interface LogFields {
   taskId?: string;
   workflowState?: string;
@@ -16,9 +18,20 @@ export interface LogFields {
 
 export interface LogSink {
   write(line: string): void | Promise<void>;
+  /**
+   * Entries below this level are never passed to `write` for this sink. Optional and
+   * `undefined` by default, meaning "everything" — existing sinks/callers that never set
+   * this see no behavior change. Added for guided-mode CLI output (see @ai-engine/cli's
+   * `ai start`): the console can be quieted to warn/error while the file sink keeps
+   * receiving every entry unconditionally, so full observability is never lost, only the
+   * console's share of it is reduced for a specific invocation.
+   */
+  minLevel?: LogLevel;
 }
 
-/** Appends JSONL to a file, creating parent directories on first write. */
+/** Appends JSONL to a file, creating parent directories on first write. Never filtered by
+ *  level — this is the durable, complete record; only ConsoleSink (or a caller's own sink)
+ *  should ever set `minLevel`. */
 export class FileSink implements LogSink {
   private ready: Promise<void> | undefined;
 
@@ -38,6 +51,10 @@ export class FileSink implements LogSink {
 }
 
 export class ConsoleSink implements LogSink {
+  /** Defaults to "debug" (everything) — the exact prior behavior for any existing caller
+   *  that doesn't pass a level explicitly. */
+  constructor(readonly minLevel: LogLevel = "debug") {}
+
   write(line: string): void {
     // Human-readable console mirror is handled by the CLI; sinks stay machine-format.
     process.stderr.write(line + "\n");
@@ -69,7 +86,10 @@ export class Logger {
       ...(redact({ ...this.bound, ...fields }) as Record<string, unknown>)
     };
     const line = JSON.stringify(entry);
-    for (const sink of this.sinks) void sink.write(line);
+    for (const sink of this.sinks) {
+      if (sink.minLevel && LEVEL_ORDER[level] < LEVEL_ORDER[sink.minLevel]) continue;
+      void sink.write(line);
+    }
   }
 
   debug(msg: string, fields?: LogFields): void {

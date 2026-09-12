@@ -8,7 +8,7 @@ import { GlobalConfigSchema, type GlobalConfig } from "@ai-engine/config";
 import { buildDefaultWorkflow, WorkflowEngine } from "@ai-engine/workflow";
 import { SecurityPolicy, CommandApprovalStore } from "@ai-engine/security";
 import { GitRepository } from "@ai-engine/git";
-import { createLogger } from "@ai-engine/logging";
+import { createLogger, type Logger, type LogSink } from "@ai-engine/logging";
 import type { AgentInvocationRequest, AgentResult } from "@ai-engine/core";
 import { TaskStore } from "./task-store.js";
 import { RoleRegistry, type ProviderFactory } from "./role-registry.js";
@@ -35,9 +35,21 @@ function mockResponder(request: AgentInvocationRequest): AgentResult {
   }
 }
 
+/** Captures every log entry written to it, for tests asserting an observer failure was actually
+ *  logged (see run()'s onBeforeStep/onAfterStep safety tests below) — never used by default, so
+ *  every existing test's `createLogger([])` (no sinks) behavior is unchanged unless a test
+ *  explicitly opts in via buildOrchestrator's `logger` parameter. */
+class CapturingSink implements LogSink {
+  entries: Array<{ level: string; msg: string; [key: string]: unknown }> = [];
+  write(line: string): void {
+    this.entries.push(JSON.parse(line));
+  }
+}
+
 async function buildOrchestrator(
   configOverrides: Partial<GlobalConfig> = {},
-  provider = new MockProvider("mock", mockResponder)
+  provider = new MockProvider("mock", mockResponder),
+  logger: Logger = createLogger([])
 ): Promise<Orchestrator> {
   const gitRepo = await GitRepository.discover(repoDir);
   const paths = {
@@ -63,7 +75,6 @@ async function buildOrchestrator(
   const roleRegistry = new RoleRegistry(globalConfig, undefined, factories);
   const securityPolicy = new SecurityPolicy(globalConfig.security);
   const commandApprovalStore = new CommandApprovalStore(join(dataDir, "approvals.json"));
-  const logger = createLogger([]);
   const workflow = new WorkflowEngine(buildDefaultWorkflow(), globalConfig.workflow);
   const taskStore = new TaskStore(paths.taskStoreDir);
 
@@ -213,5 +224,138 @@ describe("Orchestrator end-to-end (mock providers, real git + workflow)", () => 
     expect(task.workflowState).toBe("TASK_CREATED");
     task = await orchestrator.cancel(task.id, "alice", "no longer needed");
     expect(task.workflowState).toBe("CANCELLED");
+  });
+
+  it("providerIdForRole resolves the same mapping actual invocations use", async () => {
+    const orchestrator = await buildOrchestrator();
+    for (const role of ["architect", "implementer", "reviewer", "security_reviewer", "verifier"]) {
+      expect(orchestrator.providerIdForRole(role)).toBe("mock");
+    }
+  });
+
+  describe("run()'s onBeforeStep/onAfterStep — guided-mode's only hook into the state machine", () => {
+    it("fires onBeforeStep once per internal step, in the exact order those steps actually ran, with the state at the moment each one started", async () => {
+      const orchestrator = await buildOrchestrator();
+      const task = await orchestrator.createTask("Add a feature");
+
+      const before: string[] = [];
+      const after: Array<{ from: string; to: string }> = [];
+      const result = await orchestrator.run(task.id, {
+        onBeforeStep: (state) => before.push(state),
+        onAfterStep: (from, updated) => after.push({ from, to: updated.workflowState })
+      });
+
+      expect(result.workflowState).toBe("AWAITING_APPROVAL");
+      // analyze() advances TASK_CREATED all the way to AWAITING_APPROVAL in one call, so the
+      // loop's next iteration sees AWAITING_APPROVAL and stops via the switch's default case.
+      // onBeforeStep fires unconditionally at the top of every iteration (including that final,
+      // no-op one) — harmless, since a caller (guided.ts) only has progress text for states that
+      // actually do something. onAfterStep only fires for the one iteration that actually ran a
+      // step, since the default case returns before reaching it.
+      expect(before).toEqual(["TASK_CREATED", "AWAITING_APPROVAL"]);
+      expect(after).toEqual([{ from: "TASK_CREATED", to: "AWAITING_APPROVAL" }]);
+    });
+
+    it("never fires onAfterStep for the terminal default case (nothing happened, so nothing to report)", async () => {
+      const orchestrator = await buildOrchestrator();
+      const task = await orchestrator.createTask("Add a feature");
+      await orchestrator.run(task.id); // -> AWAITING_APPROVAL
+
+      const before: string[] = [];
+      const after: string[] = [];
+      // Calling run() again on an already-stopped task should be a pure no-op: one
+      // onBeforeStep observing the current (unchanged) state, and no onAfterStep at all,
+      // since the switch's default branch returns immediately.
+      await orchestrator.run(task.id, {
+        onBeforeStep: (state) => before.push(state),
+        onAfterStep: () => after.push("should not happen")
+      });
+      expect(before).toEqual(["AWAITING_APPROVAL"]);
+      expect(after).toEqual([]);
+    });
+
+    it("omitting both callbacks entirely preserves existing run() behavior exactly (backward compatibility)", async () => {
+      const orchestrator = await buildOrchestrator();
+      const task = await orchestrator.createTask("Add a feature");
+      const result = await orchestrator.run(task.id);
+      expect(result.workflowState).toBe("AWAITING_APPROVAL");
+    });
+
+    it("a throwing onBeforeStep does not alter workflow progression — run() still advances normally", async () => {
+      const orchestrator = await buildOrchestrator();
+      const task = await orchestrator.createTask("Add a feature");
+      const result = await orchestrator.run(task.id, {
+        onBeforeStep: () => {
+          throw new Error("presentation bug in a CLI callback");
+        }
+      });
+      expect(result.workflowState).toBe("AWAITING_APPROVAL"); // exactly as if the callback were absent
+    });
+
+    it("a throwing onAfterStep does not alter the already-persisted transition — run() continues and returns it normally", async () => {
+      const orchestrator = await buildOrchestrator();
+      const task = await orchestrator.createTask("Add a feature");
+      const result = await orchestrator.run(task.id, {
+        onAfterStep: () => {
+          throw new Error("presentation bug in a CLI callback");
+        }
+      });
+      expect(result.workflowState).toBe("AWAITING_APPROVAL");
+      // The persisted record itself reflects the real transition, independent of the callback:
+      const reloaded = await orchestrator.getTask(task.id);
+      expect(reloaded?.workflowState).toBe("AWAITING_APPROVAL");
+    });
+
+    it("observer failures are not silently swallowed — they're logged as a warning, with the operation and the error message", async () => {
+      const sink = new CapturingSink();
+      const orchestrator = await buildOrchestrator({}, undefined, createLogger([sink]));
+      const task = await orchestrator.createTask("Add a feature");
+      await orchestrator.run(task.id, {
+        onBeforeStep: () => {
+          throw new Error("boom-before");
+        },
+        onAfterStep: () => {
+          throw new Error("boom-after");
+        }
+      });
+
+      const warnings = sink.entries.filter((e) => e.level === "warn");
+      expect(warnings.some((w) => w.operation === "onBeforeStep" && String(w.error).includes("boom-before"))).toBe(true);
+      expect(warnings.some((w) => w.operation === "onAfterStep" && String(w.error).includes("boom-after"))).toBe(true);
+    });
+
+    it("onAfterStep is handed an isolated snapshot — mutating it (including a nested field) before throwing never leaks into what run() returns or persists", async () => {
+      const sink = new CapturingSink();
+      const orchestrator = await buildOrchestrator({}, undefined, createLogger([sink]));
+      const task = await orchestrator.createTask("Add a feature");
+
+      const result = await orchestrator.run(task.id, {
+        onAfterStep: (_from, snapshot) => {
+          // A misbehaving observer mutating its snapshot — top-level workflowState AND a nested
+          // mutable field — then throwing. A third independent review found that when the live,
+          // mutable TaskRecord was handed to observers instead of a clone, exactly this sequence
+          // let a mutation silently leak into run()'s return value even though the exception was
+          // (by design) caught and never actually persisted: an in-memory/persisted-state
+          // divergence masquerading as a successful, unaffected run.
+          snapshot.workflowState = "READY";
+          snapshot.history.push({ at: "1970-01-01T00:00:00.000Z", from: "READY", to: "READY", trigger: "forged", actor: "system" });
+          throw new Error("observer corrupted its own snapshot, then threw");
+        }
+      });
+
+      // The real transition (TASK_CREATED -> ... -> AWAITING_APPROVAL), completely unaffected.
+      expect(result.workflowState).toBe("AWAITING_APPROVAL");
+      expect(result.history.some((h) => h.trigger === "forged")).toBe(false);
+
+      const reloaded = await orchestrator.getTask(task.id);
+      expect(reloaded?.workflowState).toBe("AWAITING_APPROVAL"); // persisted state matches, not "READY"
+      expect(reloaded?.history.some((h) => h.trigger === "forged")).toBe(false);
+
+      // The failure is still logged, exactly as for any other throwing observer.
+      const warnings = sink.entries.filter((e) => e.level === "warn");
+      expect(warnings.some((w) => w.operation === "onAfterStep" && String(w.error).includes("observer corrupted its own snapshot"))).toBe(
+        true
+      );
+    });
   });
 });

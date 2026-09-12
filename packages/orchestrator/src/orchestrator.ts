@@ -11,6 +11,7 @@ import {
   type TaskRecord,
   type TaskUsage,
   type VerificationCheck,
+  type VerificationReport,
   type WorkflowState
 } from "@ai-engine/core";
 import {
@@ -25,7 +26,7 @@ import { WorkflowEngine, buildDefaultWorkflow, type Trigger } from "@ai-engine/w
 import { SecurityPolicy, sandboxDefaultsForRole, CommandApprovalStore } from "@ai-engine/security";
 import { GitRepository } from "@ai-engine/git";
 import { detectChecks, runVerification } from "@ai-engine/verification";
-import { createLogger, FileSink, ConsoleSink, type Logger, type LogSink } from "@ai-engine/logging";
+import { createLogger, FileSink, ConsoleSink, type Logger, type LogSink, type LogLevel } from "@ai-engine/logging";
 import { TaskStore } from "./task-store.js";
 import { RoleRegistry } from "./role-registry.js";
 import { generateTaskId } from "./ids.js";
@@ -116,7 +117,10 @@ function repoApprovalsFileName(repoRoot: string): string {
   return `${createHash("sha256").update(repoRoot).digest("hex").slice(0, 16)}.json`;
 }
 
-export async function createOrchestrator(startDir: string, overrides: { paths?: EnginePaths } = {}): Promise<Orchestrator> {
+export async function createOrchestrator(
+  startDir: string,
+  overrides: { paths?: EnginePaths; consoleLogLevel?: LogLevel } = {}
+): Promise<Orchestrator> {
   const gitRepo = await GitRepository.discover(startDir);
   const paths = overrides.paths ?? resolveEnginePaths();
   const globalConfig = await loadGlobalConfig(paths);
@@ -126,7 +130,12 @@ export async function createOrchestrator(startDir: string, overrides: { paths?: 
   const securityPolicy = new SecurityPolicy(globalConfig.security);
   const commandApprovalStore = new CommandApprovalStore(join(paths.dataDir, "approvals", repoApprovalsFileName(gitRepo.root)));
   const sinks: LogSink[] = [new FileSink(join(paths.logsDir, "engine.log"))];
-  if (globalConfig.logging.toConsole) sinks.push(new ConsoleSink());
+  // consoleLogLevel is an optional per-invocation override (used by `ai start`'s guided mode
+  // to show concise progress instead of raw debug/agent-event JSON) — the file sink above
+  // always receives every entry regardless, so nothing is ever lost from the durable log,
+  // only the console's share of it is reduced. Omitting it (every existing caller) preserves
+  // exactly today's behavior: everything, at "debug".
+  if (globalConfig.logging.toConsole) sinks.push(new ConsoleSink(overrides.consoleLogLevel));
   const logger = createLogger(sinks, { repository: gitRepo.root });
   const workflow = new WorkflowEngine(buildDefaultWorkflow(), globalConfig.workflow);
 
@@ -174,6 +183,18 @@ export class Orchestrator {
   async currentDiff(taskId: string) {
     const task = await this.deps.taskStore.requireTask(taskId);
     return this.deps.gitRepo.diff(task.git.commit, "HEAD", task.git.worktreePath ?? task.workspaceFolder);
+  }
+
+  /**
+   * Which provider currently fills a role, per the same global/project config resolution
+   * every actual invocation uses (`RoleRegistry.resolveProviderId`) — exposed publicly so a
+   * caller (guided-mode CLI output, an editor extension, ...) can render "Claude is
+   * planning..." from the real effective mapping instead of hardcoding a provider name.
+   * Throws the same `UnassignedRoleError` an actual invocation would if the role has no
+   * assignment, for the same reason: better to fail here than render a wrong label.
+   */
+  providerIdForRole(role: string): string {
+    return this.deps.roleRegistry.resolveProviderId(role);
   }
 
   // ---- task lifecycle -------------------------------------------------------
@@ -328,6 +349,24 @@ export class Orchestrator {
 
       task = { ...task, verification: [...task.verification, report] };
       const passed = verificationPassed(report, allChecks);
+      if (!passed) {
+        // See requiredChecksAwaitingApproval's doc comment: this must be checked, and must stop
+        // the pipeline here, BEFORE `tests_failed` ever gets applied — a second independent
+        // review found that checking for this only *after* `run()` had already driven the task
+        // through `tests_failed` -> FIXING -> (fixer can't do anything) -> ... -> BLOCKED was too
+        // late: by the time any caller could react, a test_fix iteration was already spent and
+        // the fixer had already been invoked for something it has no authority to resolve.
+        const awaiting = await this.requiredChecksAwaitingApproval(report, allChecks);
+        if (awaiting.length > 0) {
+          task = this.deps.workflow.apply(
+            task,
+            "pause",
+            "system",
+            `awaiting human approval for required verification check(s): ${awaiting.join(", ")} — this is not an implementation failure; approve with \`ai approve-check\``
+          );
+          return this.persist(task);
+        }
+      }
       task = this.deps.workflow.apply(task, passed ? "tests_passed" : "tests_failed", "system");
       return this.persist(task);
     });
@@ -513,6 +552,23 @@ export class Orchestrator {
       task = { ...task, verification: [...task.verification, report] };
       task = await this.persist(task); // durable even if the verifier role call below fails
       const automatedPass = verificationPassed(report, allChecks);
+      if (!automatedPass) {
+        // Same approval boundary as test() above, applied at final verification for the same
+        // reason: an unapproved required check is a pending human decision, not a verifier-level
+        // failure, and must stop here — before the (costly, and ultimately pointless — its
+        // verdict would be discarded regardless) verifier role invocation below, let alone
+        // `verified_fail` -> FIXING.
+        const awaiting = await this.requiredChecksAwaitingApproval(report, allChecks);
+        if (awaiting.length > 0) {
+          task = this.deps.workflow.apply(
+            task,
+            "pause",
+            "system",
+            `awaiting human approval for required verification check(s): ${awaiting.join(", ")} — this is not an implementation failure; approve with \`ai approve-check\``
+          );
+          return this.persist(task);
+        }
+      }
 
       const diff = await this.deps.gitRepo.diff(task.git.commit, "HEAD", cwd);
       const context: ContextBlock[] = [
@@ -653,12 +709,49 @@ export class Orchestrator {
     });
   }
 
-  /** Drives the task forward automatically, stopping at any approval gate, PAUSED, FAILED, or a terminal state. Never auto-retries a FAILED task — that is always an explicit human decision (see retry()). */
-  async run(taskId: string): Promise<TaskRecord> {
+  /**
+   * Drives the task forward automatically, stopping at any approval gate, PAUSED, FAILED, or
+   * a terminal state. Never auto-retries a FAILED task — that is always an explicit human
+   * decision (see retry()).
+   *
+   * `onBeforeStep`/`onAfterStep`, if given, are called immediately before and after the step
+   * for the current state runs — e.g. `onBeforeStep("IMPLEMENTING")` right before `implement()`
+   * is called, then `onAfterStep("IMPLEMENTING", <resulting task>)` right after. This exists so
+   * a caller (guided-mode CLI output) can narrate live progress ("Codex is implementing...",
+   * "✓ Implementation complete") for each step *inside* a single `run()` call, without this
+   * method's dispatch table — the actual state-machine/orchestration logic — being duplicated
+   * anywhere else: both callbacks are pure observers of a state transition that already
+   * happened here, never a second decision point. Optional and a no-op by default: every
+   * existing caller is unaffected.
+   *
+   * Observer failures can never affect workflow progression: both callbacks run through
+   * `invokeObserver`, which catches anything they throw, logs it, and continues — a second,
+   * independent review found that letting an observer's exception propagate out of `run()`
+   * would mean a caller sees an error *after* the actual mutating step already persisted its
+   * transition, which is exactly the kind of "did it happen or not" confusion this codebase
+   * works hard to avoid everywhere else (see e.g. H3 in orchestrator.hardening.test.ts). A CLI
+   * presentation bug must never become a workflow-correctness bug.
+   *
+   * `onAfterStep` is handed a `structuredClone()` snapshot of `task`, never the live object this
+   * loop itself goes on to use — a third independent review found that passing the live,
+   * mutable `TaskRecord` let a misbehaving observer mutate it (e.g. `task.workflowState =
+   * "READY"`) before throwing, and since the exception is caught (by design, see above), that
+   * mutation would otherwise silently leak into what `run()` returns even though it was never
+   * actually persisted — a real in-memory/persisted-state divergence, not just a cosmetic one.
+   * Cloning is the smallest fix that keeps observers genuinely presentation-only: whatever an
+   * observer does to its copy, orchestration never sees it. `onBeforeStep` needs no equivalent
+   * treatment — it's only ever given a `WorkflowState` string, which is already immutable.
+   */
+  async run(
+    taskId: string,
+    opts: { onBeforeStep?: (state: WorkflowState) => void; onAfterStep?: (from: WorkflowState, task: TaskRecord) => void } = {}
+  ): Promise<TaskRecord> {
     let task = await this.deps.taskStore.requireTask(taskId);
     const maxSteps = 50;
     for (let i = 0; i < maxSteps; i++) {
-      switch (task.workflowState) {
+      const fromState = task.workflowState;
+      this.invokeObserver(opts.onBeforeStep, fromState, "onBeforeStep");
+      switch (fromState) {
         case "TASK_CREATED":
         case "ANALYZING": // ANALYZING only appears here after `retry` recovers a FAILED task — see analyze()
           task = await this.analyze(task.id);
@@ -684,11 +777,47 @@ export class Orchestrator {
         default:
           return task; // AWAITING_APPROVAL, PAUSED, READY, FAILED, CANCELLED, BLOCKED, IDLE
       }
+      this.invokeObserverWithTask(opts.onAfterStep, fromState, task, "onAfterStep");
     }
     return task;
   }
 
   // ---- internals --------------------------------------------------------
+
+  /** Runs a `run()` observer callback, catching (and logging, never silently swallowing) anything
+   *  it throws — see `run()`'s doc comment for why this must never affect workflow progression. */
+  private invokeObserver(fn: ((state: WorkflowState) => void) | undefined, state: WorkflowState, label: string): void {
+    if (!fn) return;
+    try {
+      fn(state);
+    } catch (err) {
+      this.deps.logger.warn("run() observer callback threw and was ignored", {
+        operation: label,
+        workflowState: state,
+        error: err instanceof Error ? err.message : String(err)
+      });
+    }
+  }
+
+  /** Same contract as `invokeObserver`, for the `onAfterStep(from, task)` shape — see `run()`'s
+   *  doc comment for why `task` is cloned before the observer ever sees it. */
+  private invokeObserverWithTask(
+    fn: ((from: WorkflowState, task: TaskRecord) => void) | undefined,
+    from: WorkflowState,
+    task: TaskRecord,
+    label: string
+  ): void {
+    if (!fn) return;
+    try {
+      fn(from, structuredClone(task));
+    } catch (err) {
+      this.deps.logger.warn("run() observer callback threw and was ignored", {
+        operation: label,
+        workflowState: from,
+        error: err instanceof Error ? err.message : String(err)
+      });
+    }
+  }
 
   private async submitForApproval(taskId: string): Promise<TaskRecord> {
     return this.withTaskLock(taskId, async () => {
@@ -752,6 +881,45 @@ export class Orchestrator {
 
   private describeFailure(result: AgentResult): string {
     return result.error?.message ?? `agent run ended with status "${result.status}"`;
+  }
+
+  /**
+   * Distinguishes "genuinely failing" from "a required repository-configured check is simply
+   * waiting on the one-time human approval it hasn't received yet" (see docs/security.md#c1 and
+   * CommandApprovalStore) — used by both test() and finalVerify() immediately after computing
+   * `verificationPassed()`, and deliberately BEFORE either one applies its failure trigger
+   * (`tests_failed`/`verified_fail`). A second independent review found that checking for this
+   * only after the fact (once `run()` had already driven the task through FIXING, possibly all
+   * the way to BLOCKED) was too late: a test_fix iteration was already spent and the fixer/
+   * verifier had already been invoked for something neither has any authority to resolve.
+   *
+   * A verification report's `NOT_APPROVED` status alone conflates two different situations:
+   *   - a check that has genuinely never been approved (the common case — a human just needs to
+   *     run `ai approve-check`), and
+   *   - a check that IS approved (the approval store says so) but is still blocked for another
+   *     reason — e.g. it also matches the security denylist (see @ai-engine/verification's
+   *     runner.ts, which checks the denylist *before* ever consulting the approval store, so an
+   *     approved-but-denylisted command stays `NOT_APPROVED` forever; `approveVerificationCommand`
+   *     cannot and does not override the denylist).
+   *
+   * Only the first is something a one-time approval can resolve, so only the first pauses here.
+   * The second is a genuine, permanent failure and must fall through to the ordinary
+   * `tests_failed`/`verified_fail` -> FIXING -> ... -> BLOCKED path exactly like any other
+   * failing check — otherwise a check a human already (mistakenly) tried to approve would just
+   * pause again forever. Consulting the approval store's CURRENT state here, rather than trusting
+   * the historical report result alone, is what makes that distinction possible, and is also
+   * what stops an already-approved check from ever being flagged a second time (see guided.ts's
+   * matching fix in its own, independent detection layer).
+   */
+  private async requiredChecksAwaitingApproval(report: VerificationReport, checks: VerificationCheck[]): Promise<string[]> {
+    const requiredIds = new Set(checks.filter((c) => c.requiredForReady).map((c) => c.id));
+    const awaiting: string[] = [];
+    for (const r of report.results) {
+      if (r.status !== "NOT_APPROVED" || !requiredIds.has(r.checkId)) continue;
+      const check = checks.find((c) => c.id === r.checkId);
+      if (check && !(await this.deps.commandApprovalStore.isApproved(check.command))) awaiting.push(r.checkId);
+    }
+    return awaiting;
   }
 
   /** additionalChecks from .ai/project.yaml (repository_configured, gated by explicit approval) merged with disabled-check exemption (see docs/troubleshooting.md — verification.disable). */

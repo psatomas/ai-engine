@@ -109,8 +109,30 @@ instructions (a ready-to-install `.vsix` is built via `npm run package` in `exte
 
 ## 6. CLI usage
 
+### Guided mode (recommended)
+
 ```sh
 ai init
+ai start "Add rate limiting to the /login endpoint"
+```
+
+Creates the task and drives it to a terminal state automatically — analysis/planning, implementation,
+verification, and review all happen without you touching another command. You're only ever prompted
+for the decisions that are actually a human's to make: approving the plan, approving a required
+repository-configured verification command the first time it's seen, approving the `security_review`
+gate, and (if a step genuinely fails) deciding whether to retry. The task id is
+handled internally for the rest of the run — no copying it between commands — and is only ever shown
+for traceability (`ai status <taskId>` still works afterward). `ai start` never merges or pushes
+anything; that remains a manual step once the task reaches `READY`. See [docs/cli.md](./docs/cli.md#guided-mode-ai-start)
+for the full walkthrough, non-interactive behavior, and `--verbose`.
+
+### Manual mode (scripting, debugging, recovery, advanced control)
+
+Every state transition guided mode drives is also a standalone command — nothing below is replaced
+or removed by `ai start`, and `ai status <taskId>` always shows a concrete "Next action" hint for
+whichever command applies to a task's current state:
+
+```sh
 ai task "Add rate limiting to the /login endpoint"
 ai plan <taskId>          # -> AWAITING_APPROVAL
 ai approve <taskId>

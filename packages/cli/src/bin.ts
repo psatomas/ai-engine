@@ -12,6 +12,7 @@ import {
 import { resolveEnginePaths, loadGlobalConfig } from "@ai-engine/config";
 import { TaskLockedError } from "@ai-engine/security";
 import { formatFindings, formatTaskDetail, formatTaskLine, formatVerificationChecks, formatVerificationResults } from "./format.js";
+import { runGuided, createRealIO, NonInteractiveApprovalRequiredError } from "./guided.js";
 
 const program = new Command();
 program.name("ai").description("AI Engine — provider-independent AI software-engineering orchestration control plane.").version("0.1.0");
@@ -63,8 +64,33 @@ program
   });
 
 program
+  .command("start <request...>")
+  .description(
+    "Guided mode (recommended): create a task and drive it to a terminal state automatically, prompting only for the human decisions that actually require judgment (plan approval, security review, a FAILED retry). Everything below this command still works standalone for scripting, debugging, recovery, and advanced control."
+  )
+  .option("--by <name>", "identity recorded for any approvals made during this run", "operator")
+  .option(
+    "--verbose",
+    "show full structured debug/provider-event logging on the console (the default is concise progress only; nothing is ever omitted from the log file either way)"
+  )
+  .action(async (requestParts: string[], opts: { by: string; verbose?: boolean }) => {
+    try {
+      const orchestrator = await createOrchestrator(process.cwd(), opts.verbose ? {} : { consoleLogLevel: "warn" });
+      const io = createRealIO();
+      await runGuided(orchestrator, requestParts.join(" "), io, opts.by);
+    } catch (err) {
+      if (err instanceof NonInteractiveApprovalRequiredError) {
+        process.stderr.write(`error: ${err.message}\n`);
+        process.exitCode = 1;
+        process.exit(1);
+      }
+      fail(err);
+    }
+  });
+
+program
   .command("task <request...>")
-  .description("Create a new task from a natural-language request")
+  .description("Create a new task from a natural-language request (manual/low-level — see `ai start` for the guided equivalent)")
   .action(async (requestParts: string[]) => {
     try {
       const orchestrator = await createOrchestrator(process.cwd());

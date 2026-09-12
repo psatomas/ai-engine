@@ -42,7 +42,46 @@ export function formatTaskDetail(task: TaskRecord): string {
     lines.push("", "Failures:");
     for (const f of task.failures) lines.push(`  ${f.at} [${f.state}] ${f.message}`);
   }
+  const nextAction = formatNextAction(task);
+  if (nextAction) lines.push("", "Next action:", ...nextAction.map((l) => `  ${l}`));
   return lines.join("\n");
+}
+
+/**
+ * A short "what do I actually do next" hint for `ai status`, so a manual/low-level-mode user
+ * doesn't have to re-derive which command applies to the current state from memory. Purely
+ * advisory text over the same commands documented in docs/cli.md — never invents a new
+ * capability, and guided mode (`ai start`) doesn't consult this at all; it already knows the
+ * state semantically. Returns undefined for states with nothing actionable to suggest
+ * (CANCELLED, or mid-pipeline states with no single obvious next command).
+ */
+function formatNextAction(task: TaskRecord): string[] | undefined {
+  switch (task.workflowState) {
+    case "TASK_CREATED":
+      return ["Run analysis and planning.", "", `  ai plan ${task.id}`];
+    case "AWAITING_APPROVAL":
+      return ["Review the plan and approve it.", "", `  ai approve ${task.id}`];
+    case "PAUSED":
+      if (task.pendingGate) {
+        return [`${task.pendingGate} requires human approval.`, "", `  ai gate ${task.id} ${task.pendingGate}`];
+      }
+      return ["Task is paused.", "", `  ai resume ${task.id}`];
+    case "FAILED":
+      return ["A step failed. Retry if this looks transient, otherwise inspect and cancel.", "", `  ai retry ${task.id}`];
+    case "BLOCKED":
+      // `retry` is legal only from FAILED, never from BLOCKED (see docs/workflow.md) — a second
+      // independent review found it suggested here regardless, a command the workflow engine
+      // would reject. Only `resume` (keep trying) and `cancel` (give up) are legal from BLOCKED.
+      return ["Blocked after repeated failures — a human decision is needed.", "", `  ai resume ${task.id}  |  ai cancel ${task.id}`];
+    case "READY":
+      return ["Task is READY. Inspect the diff before merging.", "", `  ai diff ${task.id}`];
+    case "CANCELLED":
+      return undefined;
+    default:
+      // ANALYZING/IMPLEMENTING/TESTING/REVIEWING/FIXING/VERIFYING/PLAN_READY: mid-pipeline,
+      // auto-advanceable — `ai run` (or `ai start`) is always the right next command.
+      return ["Continue driving the task forward.", "", `  ai run ${task.id}`];
+  }
 }
 
 export function formatVerificationResults(results: VerificationResult[]): string {

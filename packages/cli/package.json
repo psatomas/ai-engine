@@ -8,7 +8,9 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "exports": { ".": "./dist/index.js" },
+  "exports": {
+    ".": "./dist/index.js"
+  },
   "scripts": {
     "build": "tsc -b tsconfig.json && chmod +x dist/bin.js",
     "clean": "rm -rf dist *.tsbuildinfo"
@@ -18,9 +20,12 @@
     "@ai-engine/orchestrator": "^0.1.0",
     "@ai-engine/config": "^0.1.0",
     "@ai-engine/security": "^0.1.0",
+    "@ai-engine/git": "^0.1.0",
     "commander": "^12.1.0"
   },
   "devDependencies": {
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "@ai-engine/workflow": "^0.1.0",
+    "@ai-engine/logging": "^0.1.0"
   }
 }

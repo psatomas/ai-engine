@@ -269,3 +269,60 @@ None of this is hard-coded to Codex/Claude: it is entirely a consequence of the 
 `roles:` mapping in global config (see [configuration section of the README](../README.md#configuration)).
 Changing `implementer: claude` to `implementer: gemini` (once a Gemini adapter is registered — see
 [adding-a-provider.md](./adding-a-provider.md)) changes nothing else.
+
+## Guided mode (`ai start`) — composition, not a second workflow engine
+
+`ai start` (`packages/cli/src/guided.ts`) exists because operating the pipeline above by hand means
+knowing the state machine, copying task ids between commands, and remembering which of `ai approve`
+/ `ai gate` / `ai retry` applies to the current state. The design goal was the smallest addition that
+removes that burden **without duplicating any orchestration logic** — every transition guided mode
+drives is still performed by exactly the same `Orchestrator` methods the low-level CLI commands call,
+never a parallel implementation of the state machine.
+
+Concretely, a small number of additive, backward-compatible pieces made this possible with no
+change to `workflow`'s state machine rules, `security`, or `git` at all:
+
+- **`Orchestrator.run()` gained two optional callbacks**, `onBeforeStep`/`onAfterStep`, called
+  immediately before/after the step for the task's current state runs inside `run()`'s existing
+  per-state dispatch loop. They are pure observers — `run()`'s actual dispatch table (which state
+  maps to which method) is unchanged and still the single place that mapping is expressed; a caller
+  passing neither callback (every existing caller) sees no behavior change at all. This is what lets
+  guided mode narrate "Codex is implementing...", "✓ Implementation complete" live, for each internal
+  step of a single `run()` call, without `ai start` re-implementing which method to call for which
+  state. Anything an observer throws is caught, logged, and never affects progression (a CLI
+  presentation bug must never become a workflow-correctness bug), and `onAfterStep` is handed a
+  `structuredClone()` snapshot of the task rather than the live object `run()`'s loop itself uses —
+  a misbehaving observer that mutates its copy before throwing can't leak that mutation into what
+  `run()` returns or persists.
+- **`Orchestrator.test()` and `finalVerify()` stop — via the same generic `pause` transition a
+  manual `ai pause` already uses, not a new one — the moment a _required_ repository-configured
+  verification check is still awaiting approval, before ever applying `tests_failed`/
+  `verified_fail`.** This is genuinely an orchestrator-level guarantee, not something `ai start`
+  merely notices and works around afterward: without it, `run()`'s own loop would otherwise drive
+  the task through `tests_failed` -> `FIXING` -> (the fixer has no authority to grant an approval)
+  -> ... -> `BLOCKED`, spending a real fixer invocation and a real `test_fix` iteration on
+  something no amount of automation could ever resolve. The distinction between "genuinely
+  unapproved" and "approved, but still blocked for another reason (e.g. the security denylist)" is
+  made by consulting the approval store's _current_ state, not the verification report's
+  (unchanging, historical) result — see `Orchestrator.requiredChecksAwaitingApproval`'s doc
+  comment. `ai start` recognizes the resulting pause from the task's persisted verification report
+  and narrates it accurately (see [docs/cli.md](./cli.md#guided-mode-ai-start)); once approved, the
+  one legal continuation is the same `resume()` `ai resume` already uses.
+- **`Orchestrator.providerIdForRole(role)`** is a one-line public method delegating to the same
+  `RoleRegistry.resolveProviderId()` every real invocation already uses — so "Claude is planning..."
+  is resolved from the actual effective config, never a hardcoded provider name (see
+  [docs/cli.md](./cli.md#guided-mode-ai-start)).
+- **`createOrchestrator()` gained an optional `consoleLogLevel` override**, and `@ai-engine/logging`'s
+  `LogSink` gained an optional `minLevel` (defaulting to "debug" — everything — for any existing
+  sink/caller). Guided mode passes `"warn"` for the console sink specifically, so routine debug/
+  info-level provider-event JSON doesn't drown out its own progress lines; the file sink is
+  unaffected either way and always receives every entry, so no observability is lost, only the
+  console's default share of it is reduced for this one invocation. `--verbose` restores full console
+  detail by omitting the override.
+
+`packages/cli/src/guided.ts` itself talks to a narrow, structural `GuidedOrchestrator` interface (the
+handful of `Orchestrator` methods it actually calls) and an injectable `GuidedIO` (real
+stdin/stdout/readline in production, a scripted fake in tests) — not the concrete `Orchestrator`
+class or `console.log`/readline directly — specifically so the whole guided flow is testable against
+a mock without a real git repository, real config, or real provider adapters (see
+`packages/cli/src/guided.test.ts`).

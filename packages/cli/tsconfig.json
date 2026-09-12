@@ -4,6 +4,14 @@
     "outDir": "dist",
     "rootDir": "src"
   },
-  "references": [{ "path": "../core" }, { "path": "../orchestrator" }, { "path": "../config" }, { "path": "../security" }],
+  "references": [
+    { "path": "../core" },
+    { "path": "../orchestrator" },
+    { "path": "../config" },
+    { "path": "../security" },
+    { "path": "../git" },
+    { "path": "../workflow" },
+    { "path": "../logging" }
+  ],
   "include": ["src"]
 }

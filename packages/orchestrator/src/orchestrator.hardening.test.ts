@@ -243,7 +243,7 @@ describe("H4: git/task-state divergence is detected and blocks silent re-work un
 });
 
 describe("C1: repository-configured verification commands require explicit approval end-to-end", () => {
-  it("blocks the pipeline at TESTING until the command is approved, then lets it through", async () => {
+  it("pauses TESTING (never routes into FIXING) until the command is approved, spending no fixer invocation or test_fix iteration, then lets it through once approved and resumed", async () => {
     const markerFile = join(repoDir, "SHOULD_NOT_EXIST_UNTIL_APPROVED");
     const projectConfig: ProjectConfig = {
       name: "demo",
@@ -262,7 +262,8 @@ describe("C1: repository-configured verification commands require explicit appro
       review: { focusAreas: [], protocolSecurityReview: false },
       writeTaskSummaries: false
     };
-    const orchestrator = await buildOrchestrator({ projectConfig });
+    const provider = new MockProvider("mock", mockResponder);
+    const orchestrator = await buildOrchestrator({ projectConfig, provider });
 
     let task = await orchestrator.createTask("Add a feature");
     task = await orchestrator.run(task.id);
@@ -270,7 +271,19 @@ describe("C1: repository-configured verification commands require explicit appro
     task = await orchestrator.implement(task.id);
     task = await orchestrator.test(task.id);
 
-    expect(task.workflowState).toBe("FIXING"); // NOT_APPROVED counts as failing a required check
+    // An unapproved required check is a pending human decision, not a code/test failure: it must
+    // pause here, never route into FIXING (let alone escalate to BLOCKED) — see
+    // Orchestrator.requiredChecksAwaitingApproval's doc comment. A second independent review
+    // found an earlier version of this only detected/reacted to this situation from guided.ts,
+    // *after* run() had already driven the task all the way through tests_failed -> FIXING ->
+    // ... -> BLOCKED, which had already spent a real fixer invocation and a real test_fix
+    // iteration on something the fixer has no authority to resolve.
+    expect(task.workflowState).toBe("PAUSED");
+    expect(task.workflowState).not.toBe("FIXING");
+    expect(task.pendingGate).toBeUndefined(); // not a decideGate()-style gate — see guided.ts
+    expect(task.iterationCounts.test_fix ?? 0).toBe(0); // no test_fix iteration consumed
+    expect(provider.invocations.filter((i) => i.role === "implementer")).toHaveLength(1); // implement() only, fixer never ran
+
     const notApproved = task.verification.at(-1)?.results.find((r) => r.checkId === "custom.marker");
     expect(notApproved?.status).toBe("NOT_APPROVED");
     const fs = await import("node:fs/promises");
@@ -285,10 +298,71 @@ describe("C1: repository-configured verification commands require explicit appro
     const checksAfter = await orchestrator.listVerificationChecks(task.id);
     expect(checksAfter.find((c) => c.id === "custom.marker")?.approved).toBe(true);
 
-    task = await orchestrator.fix(task.id); // implementer no-ops; back to TESTING
+    // resume() — not fix() — is the only legal continuation from a gate-less PAUSED task.
+    task = await orchestrator.resume(task.id, "alice");
+    expect(task.workflowState).toBe("TESTING");
     task = await orchestrator.test(task.id);
     expect(task.verification.at(-1)?.results.find((r) => r.checkId === "custom.marker")?.status).toBe("PASS");
+    expect(task.workflowState).toBe("REVIEWING");
     await expect(fs.access(markerFile)).resolves.toBeUndefined(); // now it did run
+    expect(provider.invocations.filter((i) => i.role === "implementer")).toHaveLength(1); // still just the one — fix() was never called
+  });
+});
+
+describe("C1b: finalVerify() applies the identical approval boundary at VERIFYING", () => {
+  it("pauses instead of routing into FIXING when a required check's approval is no longer current by final verification, and never invokes the verifier role for it", async () => {
+    const markerFile = join(repoDir, "SHOULD_NOT_EXIST_UNTIL_FINAL_APPROVAL");
+    const projectConfig: ProjectConfig = {
+      name: "demo",
+      roles: {},
+      verification: {
+        additionalChecks: [
+          {
+            id: "custom.marker",
+            description: "attacker- or maintainer-defined check",
+            command: `touch "${markerFile}"`,
+            requiredForReady: true
+          }
+        ],
+        disable: []
+      },
+      review: { focusAreas: [], protocolSecurityReview: false },
+      writeTaskSummaries: false
+    };
+    const provider = new MockProvider("mock", mockResponder);
+    const orchestrator = await buildOrchestrator({
+      projectConfig,
+      provider,
+      configOverrides: { approvals: GlobalConfigSchema.shape.approvals.parse({ plan: false, security_review: false, final_merge: true }) }
+    });
+
+    let task = await orchestrator.createTask("Add a feature");
+    // plan approval is auto-approved by config, so a single run() call drives all the way
+    // through analyze/implement and stops at the first genuine stopping point: the pause.
+    task = await orchestrator.run(task.id);
+    expect(task.workflowState).toBe("PAUSED"); // unapproved — see C1 above
+
+    await orchestrator.approveVerificationCommand(task.id, "custom.marker", "alice");
+    task = await orchestrator.resume(task.id, "alice");
+    task = await orchestrator.test(task.id); // approved now — runs for real, passes
+    expect(task.workflowState).toBe("REVIEWING");
+    task = await orchestrator.review(task.id); // security_review gate disabled -> straight through
+    expect(task.workflowState).toBe("VERIFYING");
+
+    // Simulate the approval no longer being current by the time of final verification (e.g. a
+    // human revoked it, or a different machine performs final verification) — same store, same
+    // file, a fresh independent instance so this test never reaches into Orchestrator internals.
+    const approvalStore = new CommandApprovalStore(join(dataDir, "approvals.json"));
+    await approvalStore.revoke(`touch "${markerFile}"`);
+
+    task = await orchestrator.finalVerify(task.id);
+
+    expect(task.workflowState).toBe("PAUSED");
+    expect(task.workflowState).not.toBe("FIXING");
+    expect(task.iterationCounts.test_fix ?? 0).toBe(0);
+    // The (costly, and ultimately pointless — its verdict would be discarded regardless) verifier
+    // role invocation never happens for a pending-approval pause.
+    expect(provider.invocations.filter((i) => i.role === "verifier")).toHaveLength(0);
   });
 });
 
