@@ -45,14 +45,113 @@ function mapSandbox(level: SandboxLevel): string {
 }
 
 /**
- * `codex exec` has no --ask-for-approval flag (that's interactive-mode
- * only); its non-interactive analog is --approve-for-me, which routes
- * would-be approval prompts through an automatic review instead of failing
- * outright. "never" needs no flag: out-of-sandbox commands simply fail and
- * are reported back to the model.
+ * BUG FOUND BY REAL END-TO-END EXECUTION: `codex exec` has no --ask-for-approval
+ * flag (that's interactive-mode only); its non-interactive analog is
+ * --approve-for-me, which routes would-be approval prompts through an
+ * automatic review instead of failing outright. "never" needs no flag:
+ * out-of-sandbox commands simply fail and are reported back to the model,
+ * and an explicit `-s <mode>` is always safe alongside it.
+ *
+ * For any other `ApprovalPolicy`, `--approve-for-me` and an explicit `-s`
+ * turn out to be mutually exclusive at the real CLI's own argument parser —
+ * confirmed live against codex-cli 0.154.0 for *every* sandbox value, not
+ * just a mismatched one: `error: the argument '--sandbox <SANDBOX_MODE>'
+ * cannot be used with '--approve-for-me'`. `--approve-for-me` itself always
+ * implies workspace-write sandboxing (confirmed against `codex exec
+ * --help`: "Route approval requests through automatic review using the
+ * workspace-write sandbox") — it cannot be told to route approvals under a
+ * different sandbox level at all.
+ *
+ * So a non-"never" policy can only be represented when the requested
+ * sandbox already IS workspace_write (the two then agree, and
+ * --approve-for-me is sent alone, no redundant/conflicting -s). A
+ * read_only or full_access sandbox combined with a non-"never" policy has
+ * no safe representation on this CLI: silently sending --approve-for-me
+ * anyway would grant workspace-write when read_only or
+ * danger-full-access was actually requested (weakening — read_only — or
+ * changing — full_access — the sandbox without being asked to), and
+ * silently sending `-s` alone would drop the requested auto-approval
+ * behavior without saying so (a silent reinterpretation of the policy).
+ * Neither is a call this adapter makes on its own; see the "unsupported"
+ * branch's caller in runProcess, which fails the invocation explicitly
+ * instead of ever building a command the CLI would reject.
  */
-function approvalFlags(policy: ApprovalPolicy): string[] {
-  return policy === "never" ? [] : ["--approve-for-me"];
+export function codexApprovalAndSandboxArgs(sandbox: SandboxLevel, approval: ApprovalPolicy): { args: string[] } | { error: string } {
+  if (approval === "never") return { args: ["-s", mapSandbox(sandbox)] };
+  if (sandbox === "workspace_write") return { args: ["--approve-for-me"] };
+  return {
+    error:
+      `Codex CLI cannot represent approval policy "${approval}" together with sandbox "${sandbox}": ` +
+      `--approve-for-me always implies workspace-write sandboxing and cannot be combined with an explicit ` +
+      `-s flag on this CLI. Only "never" is supported with a read_only or full_access sandbox.`
+  };
+}
+
+export interface CodexArgsFiles {
+  outputLastMessageFile: string;
+  schemaFile?: string;
+}
+
+/**
+ * The single source of truth for the real argv sent to `codex exec`/`codex exec resume` —
+ * fresh and resumed invocations share the *same* approval/sandbox policy validation
+ * (`codexApprovalAndSandboxArgs` above) before either one is allowed to build a command at all,
+ * AND fresh and resumed invocations both actually carry the validated policy through to Codex.
+ *
+ * BUG FOUND BY REAL END-TO-END EXECUTION, found *again* by a first round of independent review
+ * (which correctly identified that resume validation was being skipped entirely), then found
+ * *again*, more precisely, by a second round: the first fix's claim that "`codex exec resume`
+ * has no flags to carry sandbox/approval at all" was wrong. It was based only on `codex exec
+ * resume --help` — the `resume` *subcommand's own* option list — without checking whether the
+ * *parent* `exec` command's options (which include `-s`/`--approve-for-me`/`-C`/`--add-dir`,
+ * confirmed present in `codex exec --help`, not just `codex exec resume --help`) can be
+ * positioned *before* the `resume` subcommand on the same command line. They can — confirmed
+ * live, for free, with no billed model call, against the installed CLI (codex-cli 0.154.0):
+ * `codex exec -s read-only resume <id> -` and `codex exec --approve-for-me resume <id> -` both
+ * pass argument parsing cleanly (failing only later, semantically, on "no rollout found for
+ * thread id" for a deliberately bogus id — proof the flags were accepted, not proof of their
+ * downstream effect on a *real* thread, which was not separately billed-call-verified). The
+ * same `-s`/`--approve-for-me` mutual-exclusion conflict `codexApprovalAndSandboxArgs` already
+ * enforces applies identically at this parent-level position (also confirmed live: `codex exec
+ * -s read-only --approve-for-me resume <id> -` produces the identical "cannot be used with"
+ * parser error as the fresh-invocation case).
+ *
+ * So: policy args are positioned at the `exec` parent level, BEFORE `resume <sessionId> -`, for
+ * a resumed invocation — never omitted. A resumed invocation must not silently fall back to
+ * whatever sandbox Codex's current default/config happens to be; the validated policy is sent
+ * explicitly on every invocation, fresh or resumed, identically in kind (only the position in
+ * the argv differs, because `resume` is itself a positional subcommand token that has to come
+ * after any options meant for the parent `exec` command). `-C`/`--add-dir` positioning for
+ * resume is intentionally NOT changed by this fix (out of scope for the policy-enforcement
+ * finding this addresses) — working directory for a resumed invocation still goes through
+ * execa's own `cwd` option, unchanged from before.
+ */
+export function buildCodexArgs(
+  request: Pick<AgentInvocationRequest, "resumeSessionId" | "sandbox" | "approval" | "workingDirectory" | "additionalWritableDirs">,
+  files: CodexArgsFiles,
+  options: Pick<CodexAdapterOptions, "defaultModel" | "extraArgs"> = {}
+): { args: string[] } | { error: string } {
+  const approvalAndSandbox = codexApprovalAndSandboxArgs(request.sandbox, request.approval);
+  if ("error" in approvalAndSandbox) return approvalAndSandbox;
+
+  const args: string[] = ["exec"];
+  if (request.resumeSessionId) {
+    // Policy args are parent-`exec`-level options — they must be positioned before the `resume`
+    // subcommand token, not after it (see this function's doc comment for the live confirmation).
+    args.push(...approvalAndSandbox.args);
+    args.push("resume", request.resumeSessionId, "-");
+  } else {
+    args.push("-");
+    args.push(...approvalAndSandbox.args);
+    args.push("-C", request.workingDirectory);
+    for (const dir of request.additionalWritableDirs ?? []) args.push("--add-dir", dir);
+  }
+  args.push("--json");
+  args.push("-o", files.outputLastMessageFile);
+  if (files.schemaFile) args.push("--output-schema", files.schemaFile);
+  if (options.defaultModel) args.push("-m", options.defaultModel);
+  args.push(...(options.extraArgs ?? []));
+  return { args };
 }
 
 export interface CodexAdapterOptions {
@@ -130,43 +229,42 @@ export class CodexProvider implements ProviderAdapter {
     queue: AsyncQueue<AgentEvent>,
     controller: AbortController
   ): Promise<AgentResult> {
+    // EVERY invocation — fresh or resumed — is validated against the same approval/sandbox
+    // policy before Codex is ever resolved or spawned. Checked here, first, with no I/O at all,
+    // so an unsupported combination (fresh or resumed) fails identically and immediately; see
+    // buildCodexArgs's own doc comment for exactly how the validated policy is then actually
+    // carried through to a resumed invocation (positioned before the `resume` subcommand).
+    const earlyCheck = codexApprovalAndSandboxArgs(request.sandbox, request.approval);
+    if ("error" in earlyCheck) {
+      const at = new Date().toISOString();
+      queue.push({ type: "lifecycle", phase: "started", at });
+      queue.push({ type: "lifecycle", phase: "failed", at });
+      queue.close();
+      return { status: "failure", error: { code: "CODEX_UNSUPPORTED_APPROVAL_SANDBOX", message: earlyCheck.error } };
+    }
+
     const binary = await this.resolveBinary();
     const tmpDir = await mkdtemp(join(tmpdir(), "ai-engine-codex-"));
     const lastMessageFile = join(tmpDir, "last-message.txt");
     let schemaFile: string | undefined;
 
     try {
-      // BUG FOUND BY REAL END-TO-END EXECUTION: `codex exec resume <id> -` has a materially
-      // narrower flag surface than a fresh `codex exec -` (confirmed against `codex exec resume
-      // --help` on a live install) — it does not accept `-s` (sandbox), the approval flags, `-C`
-      // (working directory), or `--add-dir` at all; passing any of them made the real CLI exit
-      // immediately with "unexpected argument '-s' found", which a retried/resumed Codex role hit
-      // on its very first real run. This was never caught by mocked-provider tests because no mock
-      // enforces the real CLI's per-subcommand argument grammar. `-C` isn't available on resume
-      // either way, so the working directory is now set via execa's own `cwd` option below
-      // instead (this also fixes a latent correctness gap: a resumed session previously had no
-      // reliable way to be pointed at the task's worktree at all).
-      const args: string[] = ["exec"];
-      const resuming = Boolean(request.resumeSessionId);
-      if (resuming) {
-        args.push("resume", request.resumeSessionId!, "-");
-      } else {
-        args.push("-");
-        args.push("-s", mapSandbox(request.sandbox));
-        args.push(...approvalFlags(request.approval));
-        args.push("-C", request.workingDirectory);
-        for (const dir of request.additionalWritableDirs ?? []) args.push("--add-dir", dir);
-      }
-      args.push("--json");
-      args.push("-o", lastMessageFile);
       if (request.outputSchema) {
         schemaFile = join(tmpDir, "schema.json");
         await writeFile(schemaFile, JSON.stringify(request.outputSchema), "utf8");
-        args.push("--output-schema", schemaFile);
       }
-      const model = this.options.defaultModel;
-      if (model) args.push("-m", model);
-      args.push(...(this.options.extraArgs ?? []));
+      const built = buildCodexArgs(request, { outputLastMessageFile: lastMessageFile, schemaFile }, this.options);
+      if ("error" in built) {
+        // Unreachable in practice (earlyCheck above already validated the identical inputs) —
+        // handled anyway because buildCodexArgs is a fully self-contained, independently-correct
+        // function and its return type says this is possible; never silently ignored.
+        const at = new Date().toISOString();
+        queue.push({ type: "lifecycle", phase: "started", at });
+        queue.push({ type: "lifecycle", phase: "failed", at });
+        queue.close();
+        return { status: "failure", error: { code: "CODEX_UNSUPPORTED_APPROVAL_SANDBOX", message: built.error } };
+      }
+      const args = built.args;
 
       // `codex exec` has no separate system-prompt channel (confirmed against --help): unlike
       // Claude's --append-system-prompt, there is no API-level boundary to put the system policy
