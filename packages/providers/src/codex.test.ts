@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { AgentInvocationRequest } from "@ai-engine/core";
-import { buildCodexArgs, CodexProvider, codexApprovalAndSandboxArgs } from "./codex.js";
+import {
+  buildCodexArgs,
+  CodexProvider,
+  codexApprovalAndSandboxArgs,
+  codexInvocationUsage,
+  latestCodexUsage,
+  usageFromCodexEvent
+} from "./codex.js";
 
 function baseRequest(overrides: Partial<AgentInvocationRequest> = {}): AgentInvocationRequest {
   return {
@@ -15,6 +22,207 @@ function baseRequest(overrides: Partial<AgentInvocationRequest> = {}): AgentInvo
     ...overrides
   };
 }
+
+/**
+ * Transcribed verbatim from real, live, authenticated `codex exec --json` invocations
+ * (codex-cli 0.154.0) — this is the actual, confirmed shape usage arrives in on the stream this
+ * adapter parses. IMPORTANT: this is a CUMULATIVE
+ * per-thread snapshot, not a per-invocation delta (see usageFromTurnCompleted's doc comment for
+ * the real chained fresh->resume experiment that proved this) — these exact numbers are Codex's
+ * raw report, not "what this one invocation consumed."
+ */
+function realTurnCompletedUsage() {
+  return {
+    input_tokens: 33388,
+    cached_input_tokens: 28544,
+    cache_write_input_tokens: 0,
+    output_tokens: 92,
+    reasoning_output_tokens: 42
+  };
+}
+
+describe("usageFromCodexEvent", () => {
+  it("reads usage from the real, live turn.completed shape this adapter's stream actually emits", () => {
+    const usage = usageFromCodexEvent({ type: "turn.completed", usage: realTurnCompletedUsage() });
+    expect(usage).toEqual({
+      inputTokens: 33388,
+      cachedInputTokens: 28544,
+      cacheWriteInputTokens: 0,
+      outputTokens: 92,
+      reasoningOutputTokens: 42
+    });
+  });
+
+  it("returns undefined for an unrelated event — never fabricates usage for a shape it doesn't recognize", () => {
+    expect(usageFromCodexEvent({ type: "item.completed", item: { type: "agent_message", text: "hi" } })).toBeUndefined();
+    expect(usageFromCodexEvent({ type: "thread.started", thread_id: "t-1" })).toBeUndefined();
+  });
+
+  it("REMOVED BY FINDING 3: token_count is no longer recognized at all — repeated rate-limit-only notifications could double-count if it were", () => {
+    expect(usageFromCodexEvent({ type: "token_count", info: { last_token_usage: { input_tokens: 100 } } })).toBeUndefined();
+    expect(
+      usageFromCodexEvent({ type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 100 } } } })
+    ).toBeUndefined();
+  });
+
+  it("degrades safely (undefined, never throws) when turn.completed's usage is missing or malformed", () => {
+    expect(usageFromCodexEvent({ type: "turn.completed" })).toBeUndefined();
+    expect(usageFromCodexEvent({ type: "turn.completed", usage: null })).toBeUndefined();
+    expect(usageFromCodexEvent({ type: "turn.completed", usage: "not-an-object" })).toBeUndefined();
+  });
+
+  describe("malformed individual numeric fields (provider JSON is an untrusted external boundary)", () => {
+    it("omits a numeric-string dimension rather than string-concatenating it — other valid dimensions in the same event are unaffected", () => {
+      const usage = usageFromCodexEvent({ type: "turn.completed", usage: { input_tokens: "10", output_tokens: 5 } });
+      expect(usage?.inputTokens).toBeUndefined();
+      expect(usage?.outputTokens).toBe(5);
+    });
+
+    it("omits a negative dimension rather than letting it corrupt accounting", () => {
+      const usage = usageFromCodexEvent({ type: "turn.completed", usage: { cached_input_tokens: -5, output_tokens: 5 } });
+      expect(usage?.cachedInputTokens).toBeUndefined();
+      expect(usage?.outputTokens).toBe(5);
+    });
+
+    it("omits a null dimension rather than letting it coerce to a fabricated 0 (0 + null === 0 in JS)", () => {
+      const usage = usageFromCodexEvent({ type: "turn.completed", usage: { output_tokens: null, input_tokens: 7 } });
+      expect(usage?.outputTokens).toBeUndefined();
+      expect(usage?.inputTokens).toBe(7);
+    });
+
+    it("omits a NaN dimension", () => {
+      const usage = usageFromCodexEvent({ type: "turn.completed", usage: { reasoning_output_tokens: NaN, input_tokens: 7 } });
+      expect(usage?.reasoningOutputTokens).toBeUndefined();
+      expect(usage?.inputTokens).toBe(7);
+    });
+
+    it("omits an Infinity (or -Infinity) dimension", () => {
+      const usage = usageFromCodexEvent({
+        type: "turn.completed",
+        usage: { input_tokens: Infinity, cache_write_input_tokens: -Infinity, output_tokens: 7 }
+      });
+      expect(usage?.inputTokens).toBeUndefined();
+      expect(usage?.cacheWriteInputTokens).toBeUndefined();
+      expect(usage?.outputTokens).toBe(7);
+    });
+
+    it("preserves a genuinely valid 0 — a real reported zero is never confused with a missing/invalid field", () => {
+      const usage = usageFromCodexEvent({ type: "turn.completed", usage: { cache_write_input_tokens: 0 } });
+      expect(usage).toEqual({ cacheWriteInputTokens: 0 });
+    });
+
+    it("preserves a valid positive integer", () => {
+      const usage = usageFromCodexEvent({ type: "turn.completed", usage: { output_tokens: 42 } });
+      expect(usage).toEqual({ outputTokens: 42 });
+    });
+
+    it("omits a fractional (non-integer) dimension — no real Codex evidence supports fractional token counts", () => {
+      const usage = usageFromCodexEvent({ type: "turn.completed", usage: { input_tokens: 10.5, output_tokens: 7 } });
+      expect(usage?.inputTokens).toBeUndefined();
+      expect(usage?.outputTokens).toBe(7);
+    });
+
+    it("through the complete stream-aggregation path: when every dimension in the only observed event is malformed, usage becomes undefined — never a fabricated-zero AgentResult.usage", () => {
+      const usage = latestCodexUsage([
+        {
+          type: "turn.completed",
+          usage: { input_tokens: "10", cached_input_tokens: -5, output_tokens: null, reasoning_output_tokens: NaN }
+        }
+      ]);
+      expect(usage).toBeUndefined();
+    });
+  });
+});
+
+describe("latestCodexUsage — turn.completed is a CUMULATIVE snapshot, never summed across records", () => {
+  it("a single turn.completed record: returned as-is", () => {
+    const usage = latestCodexUsage([{ type: "turn.completed", usage: realTurnCompletedUsage() }]);
+    expect(usage).toEqual({
+      inputTokens: 33388,
+      cachedInputTokens: 28544,
+      cacheWriteInputTokens: 0,
+      outputTokens: 92,
+      reasoningOutputTokens: 42
+    });
+  });
+
+  it("FINDING 3 REGRESSION: multiple turn.completed records are NEVER summed — the LAST one is authoritative, since each is a cumulative total, not an independent delta", () => {
+    const usage = latestCodexUsage([
+      { type: "turn.completed", usage: { input_tokens: 100, output_tokens: 10 } },
+      { type: "turn.completed", usage: { input_tokens: 150, output_tokens: 15 } }
+    ]);
+    // Must be exactly the last snapshot (150), never the sum (100 + 150 = 250).
+    expect(usage).toEqual({ inputTokens: 150, outputTokens: 15 });
+  });
+
+  it("token_count records are never recognized at all (Finding 3: removed entirely) — ignored, not summed, not used as a fallback", () => {
+    const usage = latestCodexUsage([
+      { type: "token_count", info: { last_token_usage: { input_tokens: 999 } } },
+      { type: "turn.completed", usage: { input_tokens: 50 } }
+    ]);
+    expect(usage).toEqual({ inputTokens: 50 });
+  });
+
+  it("repeated compatibility-shaped notifications never produce any usage now that token_count is unsupported", () => {
+    const usage = latestCodexUsage([
+      { type: "token_count", info: { last_token_usage: { input_tokens: 10 } } },
+      { type: "token_count", info: { last_token_usage: { input_tokens: 10 } } },
+      { type: "token_count", info: { last_token_usage: { input_tokens: 10 } } }
+    ]);
+    expect(usage).toBeUndefined();
+  });
+
+  it("returns undefined for an empty or entirely unrelated stream — never fabricates usage", () => {
+    expect(latestCodexUsage([])).toBeUndefined();
+    expect(latestCodexUsage([{ type: "thread.started", thread_id: "t-1" }, { type: "turn.started" }])).toBeUndefined();
+  });
+});
+
+describe("codexInvocationUsage — converting Codex's raw cumulative-per-thread usage into this invocation's own delta (Finding 2)", () => {
+  it("fresh: cumulative 100 -> observed invocation usage 100 (the cumulative total IS the delta when nothing precedes it)", () => {
+    const usage = codexInvocationUsage({ inputTokens: 100 }, false, undefined);
+    expect(usage).toEqual({ inputTokens: 100 });
+  });
+
+  it("fresh: previousCumulativeUsage is ignored entirely, even if (incorrectly) provided — there is nothing to subtract on a fresh invocation", () => {
+    const usage = codexInvocationUsage({ inputTokens: 100 }, false, { inputTokens: 40 });
+    expect(usage).toEqual({ inputTokens: 100 });
+  });
+
+  it("resume same provider session: previous cumulative 100, current cumulative 150 -> observed invocation usage 50", () => {
+    const usage = codexInvocationUsage({ inputTokens: 150 }, true, { inputTokens: 100 });
+    expect(usage).toEqual({ inputTokens: 50 });
+  });
+
+  it("another resume of the same session: previous cumulative 150, current cumulative 180 -> observed invocation usage 30", () => {
+    const usage = codexInvocationUsage({ inputTokens: 180 }, true, { inputTokens: 150 });
+    expect(usage).toEqual({ inputTokens: 30 });
+  });
+
+  it("missing baseline on resume: usage is unknown/undefined, NOT the raw cumulative 150 — never fabricates a delta from nothing", () => {
+    const usage = codexInvocationUsage({ inputTokens: 150 }, true, undefined);
+    expect(usage).toBeUndefined();
+  });
+
+  it("resuming but Codex reported no usage at all this call: undefined, not the stale previous baseline", () => {
+    const usage = codexInvocationUsage(undefined, true, { inputTokens: 100 });
+    expect(usage).toBeUndefined();
+  });
+
+  it("never derives a negative delta — a baseline larger than the current cumulative total is treated as unreliable for that dimension", () => {
+    const usage = codexInvocationUsage({ inputTokens: 80 }, true, { inputTokens: 100 });
+    expect(usage?.inputTokens).toBeUndefined();
+  });
+
+  it("handles cached/reasoning/cache-write dimensions consistently with input/output under subtraction", () => {
+    const usage = codexInvocationUsage(
+      { inputTokens: 150, cachedInputTokens: 90, cacheWriteInputTokens: 10, outputTokens: 40, reasoningOutputTokens: 8 },
+      true,
+      { inputTokens: 100, cachedInputTokens: 60, cacheWriteInputTokens: 10, outputTokens: 25, reasoningOutputTokens: 3 }
+    );
+    expect(usage).toEqual({ inputTokens: 50, cachedInputTokens: 30, cacheWriteInputTokens: 0, outputTokens: 15, reasoningOutputTokens: 5 });
+  });
+});
 
 describe("codexApprovalAndSandboxArgs", () => {
   it('"never" is always safe and sends an explicit -s for every sandbox level, never --approve-for-me', () => {

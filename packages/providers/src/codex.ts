@@ -10,14 +10,163 @@ import type {
   AgentRun,
   ApprovalPolicy,
   Capability,
+  ObservedUsage,
   ProviderAdapter,
   ProviderAvailability,
   SandboxLevel
 } from "@ai-engine/core";
+import { subtractObservedUsage } from "@ai-engine/core";
 import type { Logger } from "@ai-engine/logging";
 import { resolveProviderBinary } from "./resolve.js";
 import { composeUserPrompt } from "./prompt.js";
 import { AsyncQueue } from "./async-queue.js";
+
+/**
+ * FOUND BY INDEPENDENT REVIEW: provider JSON is an external, untrusted runtime boundary — the
+ * `number` types below describe what a well-formed payload looks like, but nothing enforces that
+ * the real value on the wire actually is one. A malformed or hostile payload could contain a
+ * numeric string ("10"), a negative number, `null`, `NaN`, or `Infinity`; naively assigning it
+ * straight through (the previous behavior) let a string silently concatenate into other sums, a
+ * negative value silently corrupt totals, and `null` silently coerce to a fabricated `0` the
+ * moment it reached arithmetic (`0 + null === 0` in JS — indistinguishable from a real, reported
+ * zero).
+ *
+ * `validTokenCount` is the one place this boundary is enforced: only a genuine finite,
+ * non-negative, integer `number` is accepted — anything else is omitted (stays `undefined`,
+ * consistent with ObservedUsage's own "unknown, not zero" contract) rather than coerced.
+ * Never `Number(...)`, `|| 0`, or plain truthiness here — all of those convert garbage into a
+ * number that was never actually reported. Every real token count observed live (across both
+ * `turn.completed` and `token_count` shapes) has been a non-negative integer; there is no
+ * evidence Codex ever reports a fractional token count, so integers are required, not just
+ * "finite numbers."
+ */
+function validTokenCount(value: unknown): number | undefined {
+  if (typeof value !== "number") return undefined;
+  if (!Number.isFinite(value)) return undefined; // rejects NaN and +/-Infinity
+  if (value < 0) return undefined;
+  if (!Number.isInteger(value)) return undefined;
+  return value;
+}
+
+/**
+ * Validates every dimension independently — one malformed dimension (e.g. a corrupted
+ * `cached_input_tokens`) never invalidates the other, genuinely valid dimensions in the same
+ * usage record. If, after validation, *no* dimension is valid at all, this returns `undefined`
+ * rather than an all-`undefined` `ObservedUsage` object — both are semantically "nothing was
+ * reported," but returning `undefined` here specifically means a fully-malformed `turn.completed`
+ * is never mistaken for a genuine (if all-zero) usage report.
+ */
+function toObservedUsage(usage: Record<string, unknown> | undefined): ObservedUsage | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const observed: ObservedUsage = {
+    inputTokens: validTokenCount(usage.input_tokens),
+    cachedInputTokens: validTokenCount(usage.cached_input_tokens),
+    cacheWriteInputTokens: validTokenCount(usage.cache_write_input_tokens),
+    outputTokens: validTokenCount(usage.output_tokens),
+    reasoningOutputTokens: validTokenCount(usage.reasoning_output_tokens)
+  };
+  return Object.values(observed).some((v) => v !== undefined) ? observed : undefined;
+}
+
+/**
+ * Recognizes usage on Codex's `turn.completed` event — confirmed *live*
+ * against real authenticated `codex exec --json` invocations (codex-cli
+ * 0.154.0):
+ * `{"type":"turn.completed","usage":{"input_tokens":...,
+ * "cached_input_tokens":...,"cache_write_input_tokens":...,"output_tokens":...,
+ * "reasoning_output_tokens":...}}`. This is the actual, current shape the
+ * stream this adapter parses emits, no `event_msg` wrapper needed.
+ *
+ * CORRECTED BY INDEPENDENT REVIEW (twice): this adapter previously assumed
+ * `turn.completed.usage` was a per-invocation delta ("turn is the delta
+ * unit"). It is not. Confirmed live with a real, chained fresh -> resume
+ * experiment against the same thread: turn 1 (fresh) reported
+ * `cached_input_tokens: 12160`; turn 2 (resumed, a similarly trivial prompt)
+ * reported `cached_input_tokens: 24320` — *exactly* double, not a fresh,
+ * independent per-turn number — and `input_tokens` likewise roughly doubled
+ * (16597 -> 33554). `turn.completed.usage` is the *cumulative* total for the
+ * whole underlying thread as of that call (`ThreadTokenUsage.total`,
+ * per independent review), not this call's own delta. `codex exec` still
+ * emits exactly one `turn.completed` per process invocation (unchanged from
+ * prior live testing), so this function returns that one cumulative
+ * snapshot as-is — converting it into *this invocation's own* usage is a
+ * separate concern that needs the caller's prior baseline; see
+ * `codexInvocationUsage` below.
+ */
+function usageFromTurnCompleted(rec: Record<string, unknown>): ObservedUsage | undefined {
+  if (rec.type !== "turn.completed") return undefined;
+  const usage = rec.usage;
+  if (!usage || typeof usage !== "object") return undefined;
+  return toObservedUsage(usage as Record<string, unknown>);
+}
+
+/**
+ * REMOVED BY INDEPENDENT REVIEW (compatibility `token_count` support): this adapter previously
+ * also recognized Codex's internal `token_count` event (real, but only ever observed on Codex's
+ * separate rollout-persistence file format, never on the live `codex exec --json` stream this
+ * adapter actually reads) as a compatibility fallback. Two independent problems made it not
+ * worth keeping: (1) Codex can emit repeated `token_count`-style notifications purely because
+ * rate-limit information changed, with no new token consumption at all — summing (or even just
+ * accepting) repeated snapshots as if each were a fresh delta risks double-counting real usage
+ * for a family of events this adapter has *zero* live evidence it ever even receives; (2) with
+ * `turn.completed.usage` now confirmed live as this stream's one real, authoritative telemetry
+ * source, a compatibility path for an event shape that has never once been observed on this
+ * stream is speculative complexity with no demonstrated benefit — "simpler and safer" (the
+ * standard this correction was held to) means removing it, not making its (already unsound)
+ * summation "safer." If a future Codex CLI version's `exec --json` stream is ever confirmed to
+ * emit `token_count`, re-adding support for it — correctly, as a non-summed snapshot, exactly
+ * like `turn.completed` — is a fresh, evidence-driven decision, not a default kept "just in
+ * case." `turn.completed.usage` alone is the authoritative and only supported telemetry source.
+ */
+export function usageFromCodexEvent(rec: Record<string, unknown>): ObservedUsage | undefined {
+  return usageFromTurnCompleted(rec);
+}
+
+/**
+ * `codex exec` emits exactly one `turn.completed` per process invocation (confirmed live,
+ * including with a multi-tool-call prompt: several `item.completed` events but a single
+ * trailing `turn.completed`). If a stream ever contained more than one (not observed, but not
+ * structurally impossible either), the LAST one is authoritative, never a sum of all of
+ * them — `turn.completed.usage` is a cumulative snapshot, not a delta (see
+ * usageFromTurnCompleted's doc comment), so summing multiple snapshots would multiply the
+ * reported total rather than combine independent deltas the way the pre-cumulative-discovery
+ * design (incorrectly) did.
+ */
+export function latestCodexUsage(records: Iterable<Record<string, unknown>>): ObservedUsage | undefined {
+  let latest: ObservedUsage | undefined;
+  for (const rec of records) {
+    const usage = usageFromTurnCompleted(rec);
+    if (usage) latest = usage;
+  }
+  return latest;
+}
+
+/**
+ * Converts Codex's raw, cumulative-per-thread `turn.completed.usage` (see
+ * usageFromTurnCompleted) into *this invocation's own* observed delta — the value every other
+ * part of AI Engine (`UsageEvent`, `sumObservedUsage`, budget enforcement) already assumes
+ * `AgentResult.usage` means.
+ *
+ * - Fresh invocation (not resuming): the cumulative total IS this invocation's own delta —
+ *   there is nothing before it in the thread to subtract, so the raw snapshot is returned as-is.
+ * - Resumed invocation with a known, reliable prior cumulative baseline for this exact session
+ *   (`previousCumulativeUsage`, which the caller must supply only for the same provider+session
+ *   that produced it): `current - previous`, via
+ *   `subtractObservedUsage` (never negative, never fabricated — see its own doc comment).
+ * - Resumed invocation with NO reliable baseline (none on record, a provider/session change, or
+ *   Codex simply never having reported usage on the prior call):
+ *   `undefined` — reporting "unknown" is correct here; reporting the raw cumulative number would
+ *   silently and substantially overstate this single invocation's actual consumption.
+ */
+export function codexInvocationUsage(
+  rawCumulativeUsage: ObservedUsage | undefined,
+  isResuming: boolean,
+  previousCumulativeUsage: ObservedUsage | undefined
+): ObservedUsage | undefined {
+  if (!isResuming) return rawCumulativeUsage;
+  if (!rawCumulativeUsage || !previousCumulativeUsage) return undefined;
+  return subtractObservedUsage(rawCumulativeUsage, previousCumulativeUsage);
+}
 
 const CAPABILITIES: Capability[] = [
   "analyze",
@@ -294,6 +443,10 @@ export class CodexProvider implements ProviderAdapter {
       });
 
       const commandsRun: Array<{ command: string; exitCode: number | null }> = [];
+      // Only usage-relevant records are kept (not the whole stream) — latestCodexUsage picks the
+      // one authoritative (last, cumulative) snapshot at the end; see its doc comment for why
+      // this must never be summed.
+      const usageRecords: Record<string, unknown>[] = [];
       let providerSessionId: string | undefined;
       let finalMessageFromStream: string | undefined;
       let structuredOutput: unknown;
@@ -316,6 +469,7 @@ export class CodexProvider implements ProviderAdapter {
           if (rec.type === "thread.started" && typeof rec.thread_id === "string") {
             providerSessionId = rec.thread_id;
           }
+          if (usageFromCodexEvent(rec)) usageRecords.push(rec);
           if (rec.type === "item.completed" && typeof rec.item === "object" && rec.item) {
             const item = rec.item as Record<string, unknown>;
             if (item.type === "command_execution") {
@@ -368,12 +522,21 @@ export class CodexProvider implements ProviderAdapter {
       queue.push({ type: "lifecycle", phase: status === "success" ? "completed" : "failed", at: new Date().toISOString() });
       queue.close();
 
+      // rawCumulativeUsage is Codex's own raw, cumulative-per-thread snapshot (see
+      // usageFromTurnCompleted). `usage` (this invocation's own delta) and
+      // cumulativeUsageBaseline (the raw snapshot, returned so a caller can carry it forward as
+      // the next resume's baseline) are deliberately different values — see codexInvocationUsage.
+      const rawCumulativeUsage = latestCodexUsage(usageRecords);
+      const resuming = Boolean(request.resumeSessionId);
+
       return {
         status,
         finalMessage,
         structuredOutput,
         providerSessionId,
         commandsRun,
+        usage: codexInvocationUsage(rawCumulativeUsage, resuming, request.previousCumulativeUsage),
+        cumulativeUsageBaseline: rawCumulativeUsage,
         error:
           status === "failure"
             ? { code: "CODEX_EXEC_FAILED", message: execResult.stderr?.trim() || `codex exec exited with code ${execResult.exitCode}` }

@@ -7,6 +7,7 @@ import type {
   AgentResult,
   AgentRun,
   Capability,
+  ObservedUsage,
   ProviderAdapter,
   ProviderAvailability,
   SandboxLevel
@@ -127,8 +128,72 @@ interface ClaudeStreamMessage {
   message?: { role?: string; content?: Array<Record<string, unknown>> };
   result?: string;
   total_cost_usd?: number;
-  usage?: { input_tokens?: number; output_tokens?: number };
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    /** Tokens served from Anthropic's prompt cache — a cache hit, cheaper than a fresh input token. */
+    cache_read_input_tokens?: number;
+    /** Tokens written to the prompt cache for future reuse. */
+    cache_creation_input_tokens?: number;
+  };
   is_error?: boolean;
+}
+
+/**
+ * FOUND BY INDEPENDENT REVIEW: provider JSON is an external, untrusted runtime boundary here too
+ * (see the identical hardening in packages/providers/src/codex.ts) — `parsed = JSON.parse(line)
+ * as ClaudeStreamMessage` is an unchecked type assertion; the real runtime value can be anything
+ * regardless of what `ClaudeStreamMessage`'s declared field types claim. A malformed or hostile
+ * payload could contain a numeric string, a negative number, `null`, `NaN`, or `Infinity` for any
+ * token dimension — `validTokenCount` accepts only a genuine finite, non-negative, integer
+ * `number`, never coercing with `Number(...)`, `|| 0`, or truthiness. Never observed to be
+ * fractional for a real Claude Code token count.
+ */
+function validTokenCount(value: unknown): number | undefined {
+  if (typeof value !== "number") return undefined;
+  if (!Number.isFinite(value)) return undefined; // rejects NaN and +/-Infinity
+  if (value < 0) return undefined;
+  if (!Number.isInteger(value)) return undefined;
+  return value;
+}
+
+/**
+ * Same untrusted-boundary reasoning as `validTokenCount`, but cost is genuinely fractional
+ * (dollars, not a token count) — `total_cost_usd` is real-world observed as e.g. `0.0234` — so
+ * this deliberately does NOT require an integer, only finite and non-negative.
+ */
+function validCost(value: unknown): number | undefined {
+  if (typeof value !== "number") return undefined;
+  if (!Number.isFinite(value)) return undefined;
+  if (value < 0) return undefined;
+  return value;
+}
+
+/**
+ * Maps Claude Code's `result` stream-json message onto the normalized
+ * ObservedUsage contract. Anthropic's Messages API (which Claude Code's CLI
+ * passes usage through from) has no separate "reasoning tokens" dimension
+ * today — extended-thinking tokens are counted inside `output_tokens`, not
+ * reported on their own — so `reasoningOutputTokens` is never set here;
+ * that's an honest "this provider doesn't report this metric," not an
+ * oversight. Exported and pure so it's directly unit-testable without
+ * spawning a process.
+ *
+ * Every dimension is validated independently — one malformed dimension never invalidates the
+ * other, genuinely valid dimensions in the same result message. If, after validation, no
+ * dimension is valid or present at all, this returns `undefined` (not an all-undefined object),
+ * consistent with ObservedUsage's own "unknown, not zero" contract and with the identical choice
+ * made for Codex's `toObservedUsage`.
+ */
+export function usageFromClaudeResult(msg: ClaudeStreamMessage): ObservedUsage | undefined {
+  const observed: ObservedUsage = {
+    inputTokens: validTokenCount(msg.usage?.input_tokens),
+    cachedInputTokens: validTokenCount(msg.usage?.cache_read_input_tokens),
+    cacheWriteInputTokens: validTokenCount(msg.usage?.cache_creation_input_tokens),
+    outputTokens: validTokenCount(msg.usage?.output_tokens),
+    costUsd: validCost(msg.total_cost_usd)
+  };
+  return Object.values(observed).some((v) => v !== undefined) ? observed : undefined;
 }
 
 export class ClaudeProvider implements ProviderAdapter {
@@ -220,9 +285,7 @@ export class ClaudeProvider implements ProviderAdapter {
 
     let providerSessionId: string | undefined;
     let finalMessage: string | undefined;
-    let costUsd: number | undefined;
-    let inputTokens: number | undefined;
-    let outputTokens: number | undefined;
+    let usage: ObservedUsage | undefined;
     let resultIsError = false;
 
     if (subprocess.stdout) {
@@ -258,9 +321,7 @@ export class ClaudeProvider implements ProviderAdapter {
           }
         } else if (parsed.type === "result") {
           finalMessage = parsed.result;
-          costUsd = parsed.total_cost_usd;
-          inputTokens = parsed.usage?.input_tokens;
-          outputTokens = parsed.usage?.output_tokens;
+          usage = usageFromClaudeResult(parsed);
           resultIsError = Boolean(parsed.is_error) || parsed.subtype !== "success";
         } else {
           queue.push({ type: "raw", data: parsed });
@@ -302,7 +363,7 @@ export class ClaudeProvider implements ProviderAdapter {
       finalMessage,
       structuredOutput,
       providerSessionId: providerSessionId ?? sessionId,
-      usage: { inputTokens, outputTokens, costUsd },
+      usage,
       error:
         status === "failure"
           ? { code: "CLAUDE_EXEC_FAILED", message: execResult.stderr?.trim() || finalMessage || "claude -p exited with an error" }
