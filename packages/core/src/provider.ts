@@ -1,5 +1,6 @@
 import type { Capability } from "./roles.js";
 import type { ContextBlock } from "./trust.js";
+import type { ObservedUsage } from "./usage.js";
 
 /**
  * A provider is an external coding-agent product (Codex, Claude Code,
@@ -29,6 +30,15 @@ export interface AgentInvocationRequest {
   approval: ApprovalPolicy;
   /** Resume a prior provider-native session for this task/role, if supported. */
   resumeSessionId?: string;
+  /**
+   * For a provider whose native usage reporting is cumulative-per-thread rather than
+   * per-invocation (see `cumulativeUsageBaseline` on `AgentResult`), the last cumulative total
+   * observed for the exact session being resumed, if AI Engine has a reliable one on record.
+   * Ignored by providers that report usage as a natural per-invocation delta (e.g. Claude) or on
+   * a fresh (non-resumed) invocation, where there is nothing to subtract from. Never carried over
+   * across a provider or session change — see ProviderSessionRef in task.ts.
+   */
+  previousCumulativeUsage?: ObservedUsage;
   /** Ask the provider to validate/shape its final answer, if it supports structured output. */
   outputSchema?: Record<string, unknown>;
   /** Hard wall-clock budget for this single invocation. */
@@ -45,7 +55,7 @@ export type AgentEvent =
   | { type: "tool_result"; tool: string; isError: boolean; output: string }
   | { type: "command"; command: string; cwd: string }
   | { type: "file_change"; path: string; changeType: "created" | "modified" | "deleted" }
-  | { type: "usage"; inputTokens?: number; outputTokens?: number; costUsd?: number }
+  | ({ type: "usage" } & ObservedUsage)
   | { type: "error"; code: string; message: string }
   | { type: "raw"; data: unknown };
 
@@ -58,7 +68,17 @@ export interface AgentResult {
   providerSessionId?: string;
   filesChanged?: string[];
   commandsRun?: Array<{ command: string; exitCode: number | null }>;
-  usage?: { inputTokens?: number; outputTokens?: number; costUsd?: number };
+  /** Observed usage for this single invocation — see ObservedUsage in usage.ts for the "unknown, not zero" contract. */
+  usage?: ObservedUsage;
+  /**
+   * For a provider whose native usage reporting is cumulative-per-thread (see
+   * `previousCumulativeUsage` on `AgentInvocationRequest`), the raw new cumulative total observed
+   * this call — bookkeeping only, for the orchestrator to persist as the next invocation's
+   * baseline. This is never "what happened this call" (that's `usage` above) and is never itself
+   * fed into `UsageEvent`/summarization/display. A provider that reports natural per-invocation
+   * deltas (e.g. Claude) never sets this.
+   */
+  cumulativeUsageBaseline?: ObservedUsage;
   error?: { code: string; message: string };
 }
 
