@@ -1,7 +1,49 @@
 import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { TaskRecord } from "@ai-engine/core";
+import type { ProviderSessionRef, TaskRecord } from "@ai-engine/core";
 import { TaskLock } from "@ai-engine/security";
+
+function isValidProviderSessionRef(value: unknown): value is ProviderSessionRef {
+  if (!value || typeof value !== "object") return false;
+  const { providerId, sessionId } = value as { providerId?: unknown; sessionId?: unknown };
+  return typeof providerId === "string" && providerId !== "" && typeof sessionId === "string" && sessionId !== "";
+}
+
+/**
+ * `TaskRecord.providerSessions` used to be `Record<role, sessionId>` (a bare
+ * string, with no record of which provider created it). A record written by
+ * that older shape is tolerated, not trusted: since we cannot know which
+ * provider actually created a bare-string session id, the only safe move is
+ * to drop it — the next invocation of that role simply starts a fresh
+ * session instead of resuming, rather than risking a resume handed to the
+ * wrong provider. See ProviderSessionRef in @ai-engine/core. A record with no
+ * usable map at all (missing, null, or not an object) is backfilled with an
+ * empty one — no session is fabricated — so the next buildRequest doesn't
+ * crash reading `providerSessions[role]`.
+ *
+ * An entry is a valid ProviderSessionRef only if `providerId` and `sessionId`
+ * are both non-empty strings. Anything else is dropped as malformed — never
+ * coerced into shape (a numeric session id, or an empty provider id, would
+ * otherwise be handed to a provider CLI as if it were real).
+ */
+function normalizeProviderSessions(task: TaskRecord): TaskRecord {
+  const sessions = task.providerSessions as unknown;
+  if (!sessions || typeof sessions !== "object") return { ...task, providerSessions: {} };
+  let sawLegacyEntry = false;
+  const normalized: TaskRecord["providerSessions"] = {};
+  for (const [role, value] of Object.entries(sessions as Record<string, unknown>)) {
+    if (isValidProviderSessionRef(value)) {
+      normalized[role] = value;
+    } else {
+      sawLegacyEntry = true;
+    }
+  }
+  return sawLegacyEntry ? { ...task, providerSessions: normalized } : task;
+}
+
+function normalizeLegacyTaskRecord(task: TaskRecord): TaskRecord {
+  return normalizeProviderSessions(task);
+}
 
 export class TaskRecordCorruptedError extends Error {
   constructor(
@@ -82,11 +124,13 @@ export class TaskStore {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw err;
     }
+    let parsed: TaskRecord;
     try {
-      return JSON.parse(raw) as TaskRecord;
+      parsed = JSON.parse(raw) as TaskRecord;
     } catch (err) {
       throw new TaskRecordCorruptedError(id, this.pathFor(id), err);
     }
+    return normalizeLegacyTaskRecord(parsed);
   }
 
   async requireTask(id: string): Promise<TaskRecord> {

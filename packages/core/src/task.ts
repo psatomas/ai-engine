@@ -65,6 +65,20 @@ export interface RoleAssignment {
 }
 
 /**
+ * A provider-native resume/session id, tagged with the provider that
+ * created it. The tag is load-bearing, not decorative: without it, a role
+ * whose provider assignment changes between invocations (edited config, a
+ * project override, a future remapping) could have a *different* provider
+ * handed a resume session id it never created. `Orchestrator.buildRequest`
+ * only ever forwards `sessionId` as `resumeSessionId` when the role's
+ * currently-resolved provider id matches `providerId` here.
+ */
+export interface ProviderSessionRef {
+  providerId: string;
+  sessionId: string;
+}
+
+/**
  * The persistent identity of a single unit of engineering work. This is the
  * source of truth for workflow state — never chat history. See docs/workflow.md.
  */
@@ -97,7 +111,8 @@ export interface TaskRecord {
   createdAt: string;
   updatedAt: string;
   finalStatus?: "ready" | "failed" | "cancelled";
-  providerSessions: Record<string, string>;
+  /** Keyed by role. See ProviderSessionRef for why the provider id is bound alongside the session id. */
+  providerSessions: Record<string, ProviderSessionRef>;
   usage: TaskUsage;
   roleInvocationCounts: Record<string, number>;
 }

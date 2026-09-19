@@ -1004,6 +1004,15 @@ export class Orchestrator {
       throw new WorkspaceConfinementError(task.id, workingDirectory, pathCheck.reason);
     }
 
+    // The resume session recorded for this role is only ever handed back to the provider that
+    // created it — if the role's provider assignment has since changed (edited config, a project
+    // override, a future remapping), the new provider must start a fresh session rather than be
+    // handed a native session id it never created. See ProviderSessionRef in @ai-engine/core.
+    const providerId = this.deps.roleRegistry.resolveProviderId(role);
+    const session = task.providerSessions[role];
+    const sameProviderSession = session?.providerId === providerId;
+    const resumeSessionId = sameProviderSession ? session.sessionId : undefined;
+
     return {
       taskId: task.id,
       role,
@@ -1014,7 +1023,7 @@ export class Orchestrator {
       sandbox: defaults.sandbox,
       approval: defaults.approval,
       outputSchema: opts.outputSchema,
-      resumeSessionId: task.providerSessions[role],
+      resumeSessionId,
       timeoutMs: this.deps.globalConfig.workflow.roleTimeoutMs,
       maxCostUsd: this.deps.globalConfig.budgets.maxCostUsdPerTask
     };
@@ -1077,7 +1086,9 @@ export class Orchestrator {
     return {
       ...task,
       agentsUsed: alreadyUsed ? task.agentsUsed : [...task.agentsUsed, { role, providerId }],
-      providerSessions: result.providerSessionId ? { ...task.providerSessions, [role]: result.providerSessionId } : task.providerSessions,
+      providerSessions: result.providerSessionId
+        ? { ...task.providerSessions, [role]: { providerId, sessionId: result.providerSessionId } }
+        : task.providerSessions,
       roleInvocationCounts: { ...task.roleInvocationCounts, [role]: (task.roleInvocationCounts[role] ?? 0) + 1 },
       usage
     };

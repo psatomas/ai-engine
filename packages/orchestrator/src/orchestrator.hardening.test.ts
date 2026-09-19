@@ -9,7 +9,7 @@ import { buildDefaultWorkflow, WorkflowEngine } from "@ai-engine/workflow";
 import { SecurityPolicy, CommandApprovalStore } from "@ai-engine/security";
 import { GitRepository } from "@ai-engine/git";
 import { createLogger } from "@ai-engine/logging";
-import type { AgentInvocationRequest, AgentResult } from "@ai-engine/core";
+import type { AgentInvocationRequest, AgentResult, TaskRecord } from "@ai-engine/core";
 import { TaskStore } from "./task-store.js";
 import { RoleRegistry, type ProviderFactory } from "./role-registry.js";
 import {
@@ -47,6 +47,8 @@ async function buildOrchestrator(
     provider?: MockProvider;
     projectConfig?: ProjectConfig;
     sharedDataDir?: string;
+    /** Overrides the default single-"mock"-provider factory map, e.g. to register several distinct providers by id. */
+    factories?: Map<string, ProviderFactory>;
   } = {}
 ): Promise<Orchestrator> {
   const provider = opts.provider ?? new MockProvider("mock", mockResponder);
@@ -71,7 +73,7 @@ async function buildOrchestrator(
     },
     ...opts.configOverrides
   });
-  const factories = new Map<string, ProviderFactory>([["mock", () => provider]]);
+  const factories = opts.factories ?? new Map<string, ProviderFactory>([["mock", () => provider]]);
   const roleRegistry = new RoleRegistry(globalConfig, opts.projectConfig, factories);
   const securityPolicy = new SecurityPolicy(globalConfig.security);
   const commandApprovalStore = new CommandApprovalStore(join(thisDataDir, "approvals.json"));
@@ -697,5 +699,149 @@ describe("checkPath is genuinely wired into request building", () => {
     } finally {
       await rm(outside, { recursive: true, force: true });
     }
+  });
+});
+
+describe("H5: a resume session is never handed to a different provider than the one that created it", () => {
+  it("does not leak provider A's session id to provider B after the implementer role's provider assignment changes mid-task", async () => {
+    const providerA = new MockProvider("providerA", (request) => {
+      if (request.role === "reviewer" || request.role === "security_reviewer") {
+        return {
+          status: "success",
+          structuredOutput: {
+            verdict: "changes_requested",
+            summary: "needs work",
+            findings: [{ dimension: "correctness", severity: "major", summary: "bug", detail: "detail" }]
+          }
+        };
+      }
+      if (request.role === "implementer") {
+        return { status: "success", finalMessage: "Added feature.txt", providerSessionId: "providerA-session-123" };
+      }
+      return mockResponder(request);
+    });
+    const providerB = new MockProvider("providerB", () => ({ status: "success", finalMessage: "Fixed" }));
+
+    const sharedDataDir = dataDir;
+    const orchestrator1 = await buildOrchestrator({
+      sharedDataDir,
+      factories: new Map<string, ProviderFactory>([
+        ["providerA", () => providerA],
+        ["providerB", () => providerB]
+      ]),
+      configOverrides: {
+        roles: {
+          architect: { providerId: "providerA" },
+          implementer: { providerId: "providerA" },
+          reviewer: { providerId: "providerA" },
+          security_reviewer: { providerId: "providerA" },
+          verifier: { providerId: "providerA" }
+        }
+      }
+    });
+
+    let task = await orchestrator1.createTask("Add a feature");
+    task = await orchestrator1.run(task.id);
+    task = await orchestrator1.decidePlan(task.id, "approved", "alice");
+    task = await orchestrator1.implement(task.id);
+    task = await orchestrator1.test(task.id);
+    task = await orchestrator1.review(task.id);
+    expect(task.workflowState).toBe("FIXING");
+    expect(task.providerSessions.implementer).toEqual({ providerId: "providerA", sessionId: "providerA-session-123" });
+
+    // Simulates the implementer role's provider assignment changing between invocations of the
+    // same task (an edited config, a project override introduced mid-task, ...): a second
+    // Orchestrator sharing the same data dir whose RoleRegistry resolves "implementer" to a
+    // completely different provider.
+    const orchestrator2 = await buildOrchestrator({
+      sharedDataDir,
+      factories: new Map<string, ProviderFactory>([
+        ["providerA", () => providerA],
+        ["providerB", () => providerB]
+      ]),
+      configOverrides: { roles: { implementer: { providerId: "providerB" } } }
+    });
+
+    task = await orchestrator2.fix(task.id);
+
+    expect(providerB.invocations).toHaveLength(1);
+    expect(providerB.invocations[0]!.request.resumeSessionId).toBeUndefined();
+    // providerA's own recorded session is untouched by the switch, and providerB's own (absent)
+    // result leaves it that way — providerSessions must never end up attributing providerA's
+    // session id to providerB, or vice versa.
+    expect(task.providerSessions.implementer).toEqual({ providerId: "providerA", sessionId: "providerA-session-123" });
+  });
+});
+
+describe("H5 (persistence): legacy or malformed provider sessions on disk are normalized on load — never trusted, never a crash", () => {
+  // Persists `providerSessions` exactly as given — bypassing the type system on purpose, since these
+  // are shapes an older version, an external edit, or corruption could have left on disk — and hands
+  // back an Orchestrator whose store reads it (the real TaskStore.get() normalization path).
+  async function persistWithSessions(providerSessions: unknown): Promise<{ orchestrator: Orchestrator; taskId: string }> {
+    const orchestrator = await buildOrchestrator();
+    const created = await orchestrator.createTask("Add a feature");
+    await new TaskStore(join(dataDir, "tasks")).save({ ...created, providerSessions } as unknown as TaskRecord);
+    return { orchestrator, taskId: created.id };
+  }
+
+  it("drops a legacy bare-string session (its creating provider is unknowable) and keeps a valid { providerId, sessionId } entry", async () => {
+    const { orchestrator, taskId } = await persistWithSessions({
+      implementer: "legacy-bare-session-id",
+      reviewer: { providerId: "codex", sessionId: "reviewer-session-1" }
+    });
+
+    const reloaded = await orchestrator.getTask(taskId);
+    expect(reloaded?.providerSessions).toEqual({ reviewer: { providerId: "codex", sessionId: "reviewer-session-1" } });
+  });
+
+  it("leaves a fully valid set of sessions untouched", async () => {
+    const sessions = {
+      implementer: { providerId: "claude", sessionId: "implementer-session-1" },
+      reviewer: { providerId: "codex", sessionId: "reviewer-session-1" }
+    };
+    const { orchestrator, taskId } = await persistWithSessions(sessions);
+
+    expect((await orchestrator.getTask(taskId))?.providerSessions).toEqual(sessions);
+  });
+
+  it("drops malformed or junk entries (null, a number, an empty string, arrays, an object missing providerId or sessionId) and keeps only the valid one", async () => {
+    const { orchestrator, taskId } = await persistWithSessions({
+      a: null,
+      b: 7,
+      c: "",
+      d: { providerId: "claude" },
+      e: { sessionId: "orphan-session" },
+      g: [],
+      h: ["claude", "array-session"],
+      f: { providerId: "claude", sessionId: "valid-session" }
+    });
+
+    expect((await orchestrator.getTask(taskId))?.providerSessions).toEqual({ f: { providerId: "claude", sessionId: "valid-session" } });
+  });
+
+  it("drops entries whose providerId or sessionId is not a non-empty string — values are never coerced", async () => {
+    const { orchestrator, taskId } = await persistWithSessions({
+      numericSession: { providerId: "claude", sessionId: 123 },
+      numericProvider: { providerId: 123, sessionId: "abc" },
+      emptyProvider: { providerId: "", sessionId: "abc" },
+      emptySession: { providerId: "claude", sessionId: "" },
+      nullSession: { providerId: "claude", sessionId: null },
+      valid: { providerId: "claude", sessionId: "valid-session" }
+    });
+
+    expect((await orchestrator.getTask(taskId))?.providerSessions).toEqual({ valid: { providerId: "claude", sessionId: "valid-session" } });
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["null", null]
+  ])("tolerates a %s providerSessions map: loads as an empty map and the next invocation still runs", async (_label, persisted) => {
+    const { orchestrator, taskId } = await persistWithSessions(persisted);
+
+    expect((await orchestrator.getTask(taskId))?.providerSessions).toEqual({});
+
+    // buildRequest reads task.providerSessions[role] — a missing map must not turn into a TypeError there.
+    const task = await orchestrator.run(taskId);
+    expect(task.workflowState).toBe("AWAITING_APPROVAL");
   });
 });
