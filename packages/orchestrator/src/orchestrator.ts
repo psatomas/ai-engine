@@ -3,9 +3,13 @@ import { join } from "node:path";
 import {
   WellKnownRole,
   verificationPassed,
+  UNKNOWN_PROVIDER_CAPACITY,
   type AgentInvocationRequest,
   type AgentResult,
+  type Capability,
   type ContextBlock,
+  type ProviderAvailability,
+  type ProviderCapacityInfo,
   type ReviewFinding,
   type ReviewReport,
   type TaskRecord,
@@ -1124,4 +1128,61 @@ export class Orchestrator {
       usageEvents: [...task.usageEvents, usageEvent]
     };
   }
+
+  /**
+   * Every registered provider, generically: identity/capabilities
+   * (`RoleRegistry.describeProviders()`), which currently-configured roles
+   * resolve to it, and its live availability + capacity. This is a
+   * read-only report — no selection/routing logic reads it; it exists so a
+   * caller can enumerate providers without hardcoding ids like
+   * "claude"/"codex".
+   *
+   * Failure handling is deliberately narrow. When one provider's
+   * `checkAvailability()` rejects, it is reported as unavailable; when its
+   * `getCapacity()` rejects, its capacity is reported as unknown — in both
+   * cases with the error message as `detail`, and enumeration of the other
+   * providers continues. This covers asynchronous (rejected-promise)
+   * failures only: a synchronous throw from either method, or a provider
+   * factory that throws, is not contained and rejects the whole call.
+   */
+  async listProviders(): Promise<ProviderSummary[]> {
+    const roleNames = new Set([...Object.keys(this.deps.globalConfig.roles), ...Object.keys(this.deps.projectConfig?.roles ?? {})]);
+    const rolesByProvider = new Map<string, string[]>();
+    for (const role of roleNames) {
+      const providerId = this.deps.roleRegistry.resolveProviderId(role);
+      rolesByProvider.set(providerId, [...(rolesByProvider.get(providerId) ?? []), role]);
+    }
+
+    return Promise.all(
+      this.deps.roleRegistry.describeProviders().map(async (descriptor) => {
+        const adapter = this.deps.roleRegistry.adapterForId(descriptor.id);
+        const availability = await adapter
+          .checkAvailability()
+          .catch((err): ProviderAvailability => ({ available: false, detail: err instanceof Error ? err.message : String(err) }));
+        const capacity = adapter.getCapacity
+          ? await adapter
+              .getCapacity()
+              .catch((err): ProviderCapacityInfo => ({ status: "unknown", detail: err instanceof Error ? err.message : String(err) }))
+          : UNKNOWN_PROVIDER_CAPACITY;
+        return {
+          id: descriptor.id,
+          displayName: descriptor.displayName,
+          capabilities: descriptor.capabilities,
+          roles: rolesByProvider.get(descriptor.id) ?? [],
+          availability,
+          capacity
+        };
+      })
+    );
+  }
+}
+
+/** A single provider's identity, live availability, capacity, and role assignments — see `Orchestrator.listProviders()`. */
+export interface ProviderSummary {
+  id: string;
+  displayName: string;
+  capabilities: Capability[];
+  roles: string[];
+  availability: ProviderAvailability;
+  capacity: ProviderCapacityInfo;
 }

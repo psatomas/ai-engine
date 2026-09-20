@@ -97,6 +97,35 @@ export interface ProviderAvailability {
 }
 
 /**
+ * Account/plan metadata a provider's own status surface reports directly.
+ * `planLabel` must only ever be set from something the provider itself
+ * states (e.g. a field in its auth-status output) — never inferred or
+ * guessed from observed token counts or invocation behavior.
+ */
+export interface ProviderAccountInfo {
+  accountLabel?: string;
+  planLabel?: string;
+}
+
+/**
+ * Normalized provider/account capacity (quota) info. `"unknown"` is a
+ * first-class, expected value: an adapter with no reliable figure reports
+ * `{ status: "unknown" }` (or simply omits `getCapacity()`), so that the
+ * absence of real data is represented explicitly rather than papered over
+ * with an invented number.
+ */
+export interface ProviderCapacityInfo {
+  status: "known" | "unknown";
+  account?: ProviderAccountInfo;
+  /** Only meaningful when status === "known". 0..1, remaining fraction of quota. */
+  remainingFraction?: number;
+  resetsAt?: string;
+  detail?: string;
+}
+
+export const UNKNOWN_PROVIDER_CAPACITY: ProviderCapacityInfo = { status: "unknown" };
+
+/**
  * The single seam between the provider-independent core and a real product.
  * Everything the workflow engine needs from an external coding agent is
  * expressed here; nothing outside a provider package may import a
@@ -108,4 +137,11 @@ export interface ProviderAdapter {
   capabilities(): Capability[];
   checkAvailability(): Promise<ProviderAvailability>;
   invoke(request: AgentInvocationRequest): AgentRun;
+  /**
+   * Provider-account capacity/quota, only for adapters whose product can
+   * reliably report it. Optional and expected to be absent for most
+   * adapters today — callers must treat a missing method identically to one
+   * that resolves `{ status: "unknown" }`, never as an error.
+   */
+  getCapacity?(): Promise<ProviderCapacityInfo>;
 }

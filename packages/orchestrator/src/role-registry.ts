@@ -1,7 +1,14 @@
-import type { ProviderAdapter } from "@ai-engine/core";
+import type { Capability, ProviderAdapter } from "@ai-engine/core";
 import type { GlobalConfig, ProjectConfig, ProviderConfig } from "@ai-engine/config";
 import { resolveRoleAssignment } from "@ai-engine/config";
 import { CodexProvider, ClaudeProvider } from "@ai-engine/providers";
+
+/** A provider's identity and static capabilities, independent of any role. */
+export interface ProviderDescriptor {
+  id: string;
+  displayName: string;
+  capabilities: Capability[];
+}
 
 export type ProviderFactory = (config: ProviderConfig) => ProviderAdapter;
 
@@ -46,12 +53,34 @@ export class RoleRegistry {
     return assignment.providerId;
   }
 
+  private configFor(providerId: string, modelOverride?: string): ProviderConfig {
+    const providerConfig = this.global.providers[providerId] ?? { extraArgs: [] };
+    return { ...providerConfig, model: modelOverride ?? providerConfig.model };
+  }
+
   adapterForRole(role: string): ProviderAdapter {
     const assignment = resolveRoleAssignment(role, this.global, this.project);
     if (!assignment) throw new UnassignedRoleError(role);
-    const factory = this.factories.get(assignment.providerId);
-    if (!factory) throw new UnknownProviderError(assignment.providerId);
-    const providerConfig = this.global.providers[assignment.providerId] ?? { extraArgs: [] };
-    return factory({ ...providerConfig, model: assignment.model ?? providerConfig.model });
+    return this.adapterForId(assignment.providerId, assignment.model);
+  }
+
+  /** Instantiates a registered provider directly by id, independent of any role assignment. */
+  adapterForId(providerId: string, modelOverride?: string): ProviderAdapter {
+    const factory = this.factories.get(providerId);
+    if (!factory) throw new UnknownProviderError(providerId);
+    return factory(this.configFor(providerId, modelOverride));
+  }
+
+  /**
+   * Every registered provider's identity/capabilities, independent of which
+   * (if any) role currently uses it — the generic seed for enumerating
+   * providers without the caller needing to already know provider ids like
+   * "claude"/"codex".
+   */
+  describeProviders(): ProviderDescriptor[] {
+    return Array.from(this.factories.keys()).map((id) => {
+      const adapter = this.adapterForId(id);
+      return { id: adapter.id, displayName: adapter.displayName, capabilities: adapter.capabilities() };
+    });
   }
 }
