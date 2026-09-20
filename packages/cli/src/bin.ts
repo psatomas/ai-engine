@@ -13,6 +13,7 @@ import { resolveEnginePaths, loadGlobalConfig } from "@ai-engine/config";
 import { TaskLockedError } from "@ai-engine/security";
 import {
   formatFindings,
+  formatProviderSummaries,
   formatTaskDetail,
   formatTaskLine,
   formatTaskUsage,
@@ -368,6 +369,20 @@ program
       if (diff.suspiciousFiles.length) {
         console.error(`\n⚠ suspicious paths touched: ${diff.suspiciousFiles.join(", ")}`);
       }
+    } catch (err) {
+      fail(err);
+    }
+  });
+
+program
+  .command("providers")
+  .description(
+    "List every registered provider generically (id, capabilities, currently-assigned roles, live availability, capacity) — never hardcodes which providers exist"
+  )
+  .action(async () => {
+    try {
+      const orchestrator = await createOrchestrator(process.cwd());
+      console.log(formatProviderSummaries(await orchestrator.listProviders()));
     } catch (err) {
       fail(err);
     }

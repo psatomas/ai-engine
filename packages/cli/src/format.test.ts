@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { TaskRecord, UsageEvent, VerificationCheck } from "@ai-engine/core";
-import { formatTaskDetail, formatTaskUsage, formatVerificationChecks } from "./format.js";
+import type { ProviderSummary } from "@ai-engine/orchestrator";
+import { formatProviderSummaries, formatTaskDetail, formatTaskUsage, formatVerificationChecks } from "./format.js";
 
 function makeTask(overrides: Partial<TaskRecord>): TaskRecord {
   return {
@@ -89,6 +90,130 @@ describe("formatTaskDetail's 'Next action' rendering", () => {
   it("a mid-pipeline active state (e.g. IMPLEMENTING) points at `ai run`", () => {
     const out = formatTaskDetail(makeTask({ workflowState: "IMPLEMENTING" }));
     expect(out).toContain("ai run t-test-0001");
+  });
+});
+
+describe("formatProviderSummaries", () => {
+  it("renders an empty registry without error", () => {
+    expect(formatProviderSummaries([])).toMatch(/no providers registered/);
+  });
+
+  it("renders unknown capacity explicitly rather than omitting it", () => {
+    const summary: ProviderSummary = {
+      id: "acme",
+      displayName: "Acme Agent",
+      capabilities: ["implement", "file_modification"],
+      roles: ["implementer"],
+      availability: { available: true, authenticated: true, version: "1.2.3" },
+      capacity: { status: "unknown" }
+    };
+    const out = formatProviderSummaries([summary]);
+    expect(out).toContain("acme");
+    expect(out).toContain("capacity:  unknown");
+    expect(out).toContain("roles:     implementer");
+  });
+
+  it("renders known capacity details, including a plan label reported by the provider itself", () => {
+    const summary: ProviderSummary = {
+      id: "acme",
+      displayName: "Acme Agent",
+      capabilities: ["implement"],
+      roles: [],
+      availability: { available: true },
+      capacity: { status: "known", remainingFraction: 0.5, account: { planLabel: "Pro" }, resetsAt: "2026-01-01T00:00:00.000Z" }
+    };
+    const out = formatProviderSummaries([summary]);
+    expect(out).toContain("50% remaining");
+    expect(out).toContain("plan: Pro");
+    expect(out).toContain("roles:     (none configured)");
+  });
+
+  it("surfaces an availability failure detail instead of hiding it", () => {
+    const summary: ProviderSummary = {
+      id: "acme",
+      displayName: "Acme Agent",
+      capabilities: [],
+      roles: [],
+      availability: { available: false, detail: "binary not found" },
+      capacity: { status: "unknown" }
+    };
+    const out = formatProviderSummaries([summary]);
+    expect(out).toContain("available: false");
+    expect(out).toContain("detail:    binary not found");
+  });
+
+  it("renders every provider with its own roles, and omits optional metadata the provider did not supply", () => {
+    const acme: ProviderSummary = {
+      id: "acme",
+      displayName: "Acme Agent",
+      capabilities: ["implement"],
+      roles: ["implementer"],
+      availability: { available: true, authenticated: true, version: "1.2.3" },
+      capacity: { status: "known", remainingFraction: 0.5, account: { planLabel: "Pro" } }
+    };
+    const zenith: ProviderSummary = {
+      id: "zenith",
+      displayName: "Zenith Agent",
+      capabilities: ["review"],
+      roles: ["reviewer", "verifier"],
+      availability: { available: true },
+      capacity: { status: "known", remainingFraction: 0.25 }
+    };
+    // Each provider's block starts at a header line (no indentation); everything else is indented.
+    const blocks = formatProviderSummaries([acme, zenith]).split(/\n(?=\S)/);
+    expect(blocks).toHaveLength(2);
+    const [acmeBlock, zenithBlock] = blocks as [string, string];
+
+    expect(acmeBlock).toMatch(/^acme /);
+    expect(acmeBlock).toContain("roles:     implementer");
+    expect(acmeBlock).not.toContain("reviewer");
+    expect(acmeBlock).not.toContain("verifier");
+    expect(acmeBlock).toContain("authenticated: true");
+    expect(acmeBlock).toContain("plan: Pro");
+
+    expect(zenithBlock).toMatch(/^zenith /);
+    expect(zenithBlock).toContain("roles:     reviewer, verifier");
+    expect(zenithBlock).not.toContain("implementer");
+    expect(zenithBlock).not.toContain("authenticated:");
+    expect(zenithBlock).not.toContain("version:");
+    expect(zenithBlock).not.toContain("plan:");
+  });
+
+  it("renders a genuinely exhausted capacity (0% remaining) as known, never as unknown — and unknown as unknown", () => {
+    const exhausted: ProviderSummary = {
+      id: "acme",
+      displayName: "Acme Agent",
+      capabilities: ["implement"],
+      roles: [],
+      availability: { available: true },
+      capacity: { status: "known", remainingFraction: 0 }
+    };
+    const unknown: ProviderSummary = {
+      id: "zenith",
+      displayName: "Zenith Agent",
+      capabilities: ["implement"],
+      roles: [],
+      availability: { available: true },
+      capacity: { status: "unknown" }
+    };
+    const [exhaustedBlock, unknownBlock] = formatProviderSummaries([exhausted, unknown]).split(/\n(?=\S)/) as [string, string];
+
+    expect(exhaustedBlock).toContain("0% remaining");
+    expect(exhaustedBlock).not.toContain("unknown");
+    expect(unknownBlock).toContain("capacity:  unknown");
+    expect(unknownBlock).not.toContain("0% remaining");
+  });
+
+  it("preserves the failure detail of an unknown capacity", () => {
+    const summary: ProviderSummary = {
+      id: "acme",
+      displayName: "Acme Agent",
+      capabilities: ["implement"],
+      roles: [],
+      availability: { available: true },
+      capacity: { status: "unknown", detail: "capacity-boom" }
+    };
+    expect(formatProviderSummaries([summary])).toContain("capacity:  unknown (capacity-boom)");
   });
 });
 

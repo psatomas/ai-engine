@@ -1,5 +1,6 @@
 import type { ReviewFinding, TaskRecord, UsageEvent, UsageTotals, VerificationCheck, VerificationResult } from "@ai-engine/core";
 import { groupUsageEvents, summarizeUsageEvents } from "@ai-engine/core";
+import type { ProviderSummary } from "@ai-engine/orchestrator";
 
 /**
  * `fix()` invokes the same "implementer" role as `implement()` (see
@@ -63,6 +64,32 @@ export function formatTaskUsage(task: TaskRecord): string {
     `Task total: ${formatInvocations(total.invocations)} across ${byProvider.size} provider${byProvider.size === 1 ? "" : "s"} — ${formatUsageMetrics(total)}`
   );
   return lines.join("\n").trimEnd();
+}
+
+export function formatProviderSummaries(summaries: ProviderSummary[]): string {
+  if (summaries.length === 0) return "(no providers registered)";
+  return summaries
+    .map((p) => {
+      const lines = [
+        `${p.id}  (${p.displayName})`,
+        `    available: ${p.availability.available}${p.availability.authenticated !== undefined ? `, authenticated: ${p.availability.authenticated}` : ""}${p.availability.version ? `, version: ${p.availability.version}` : ""}`,
+        `    capacity:  ${formatCapacity(p.capacity)}`,
+        `    roles:     ${p.roles.length ? p.roles.join(", ") : "(none configured)"}`,
+        `    capabilities: ${p.capabilities.join(", ")}`
+      ];
+      if (p.availability.detail) lines.push(`    detail:    ${p.availability.detail}`);
+      return lines.join("\n");
+    })
+    .join("\n");
+}
+
+function formatCapacity(capacity: ProviderSummary["capacity"]): string {
+  if (capacity.status === "unknown") return `unknown${capacity.detail ? ` (${capacity.detail})` : ""}`;
+  const parts: string[] = ["known"];
+  if (capacity.remainingFraction !== undefined) parts.push(`${Math.round(capacity.remainingFraction * 100)}% remaining`);
+  if (capacity.account?.planLabel) parts.push(`plan: ${capacity.account.planLabel}`);
+  if (capacity.resetsAt) parts.push(`resets: ${capacity.resetsAt}`);
+  return parts.join(", ");
 }
 
 export function formatTaskLine(task: TaskRecord): string {
