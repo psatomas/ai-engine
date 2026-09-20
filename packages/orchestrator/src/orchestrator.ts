@@ -10,6 +10,7 @@ import {
   type ReviewReport,
   type TaskRecord,
   type TaskUsage,
+  type UsageEvent,
   type VerificationCheck,
   type VerificationReport,
   type WorkflowState
@@ -246,7 +247,8 @@ export class Orchestrator {
         updatedAt: now,
         providerSessions: {},
         usage: {},
-        roleInvocationCounts: {}
+        roleInvocationCounts: {},
+        usageEvents: []
       };
       const task = this.deps.workflow.apply(seed, "analyze", "human", originalRequest);
       return this.persist(task);
@@ -272,7 +274,7 @@ export class Orchestrator {
         outputSchema: ArchitectJsonSchema
       });
       const { result, providerId } = await this.invokeRole(task, WellKnownRole.Architect, request);
-      task = this.recordAgentUsage(task, WellKnownRole.Architect, providerId, result);
+      task = this.recordAgentUsage(task, WellKnownRole.Architect, providerId, result, "analyze");
 
       if (result.status !== "success") {
         task = this.deps.workflow.apply(task, "fail", { role: WellKnownRole.Architect, providerId }, this.describeFailure(result));
@@ -319,7 +321,7 @@ export class Orchestrator {
         context: [...this.planContextBlocks(task), ...projectContext]
       });
       const { result, providerId } = await this.invokeRole(task, WellKnownRole.Implementer, request);
-      task = this.recordAgentUsage(task, WellKnownRole.Implementer, providerId, result);
+      task = this.recordAgentUsage(task, WellKnownRole.Implementer, providerId, result, "implement");
 
       if (result.status !== "success") {
         task = this.deps.workflow.apply(task, "fail", { role: WellKnownRole.Implementer, providerId }, this.describeFailure(result));
@@ -423,7 +425,7 @@ export class Orchestrator {
       for (const role of [WellKnownRole.Reviewer, WellKnownRole.SecurityReviewer]) {
         const request = await this.buildRequest(task, role, { instructions, context: allContext, outputSchema: ReviewJsonSchema });
         const { result, providerId } = await this.invokeRole(task, role, request);
-        task = this.recordAgentUsage(task, role, providerId, result);
+        task = this.recordAgentUsage(task, role, providerId, result, "review");
 
         if (result.status !== "success") {
           task = this.deps.workflow.apply(task, "fail", { role, providerId }, this.describeFailure(result));
@@ -505,7 +507,7 @@ export class Orchestrator {
         context: [...this.buildFixContext(task), ...projectContext]
       });
       const { result, providerId } = await this.invokeRole(task, WellKnownRole.Implementer, request);
-      task = this.recordAgentUsage(task, WellKnownRole.Implementer, providerId, result);
+      task = this.recordAgentUsage(task, WellKnownRole.Implementer, providerId, result, "fix");
 
       if (result.status !== "success") {
         task = this.deps.workflow.apply(task, "fail", { role: WellKnownRole.Implementer, providerId }, this.describeFailure(result));
@@ -580,7 +582,7 @@ export class Orchestrator {
       const instructions = `Original request:\n${task.originalRequest}\n\nConfirm the task is genuinely complete, using the context provided below.`;
       const request = await this.buildRequest(task, WellKnownRole.Verifier, { instructions, context, outputSchema: ReviewJsonSchema });
       const { result, providerId } = await this.invokeRole(task, WellKnownRole.Verifier, request);
-      task = this.recordAgentUsage(task, WellKnownRole.Verifier, providerId, result);
+      task = this.recordAgentUsage(task, WellKnownRole.Verifier, providerId, result, "verify");
 
       if (result.status !== "success") {
         task = this.deps.workflow.apply(task, "fail", { role: WellKnownRole.Verifier, providerId }, this.describeFailure(result));
@@ -1012,6 +1014,10 @@ export class Orchestrator {
     const session = task.providerSessions[role];
     const sameProviderSession = session?.providerId === providerId;
     const resumeSessionId = sameProviderSession ? session.sessionId : undefined;
+    // The cumulative-usage baseline is tied to the exact same (provider, session) pair as the
+    // resume itself — never carried forward across a provider reassignment or a fresh session,
+    // for the identical reason resumeSessionId isn't (see ProviderSessionRef in @ai-engine/core).
+    const previousCumulativeUsage = sameProviderSession ? session.cumulativeUsageBaseline : undefined;
 
     return {
       taskId: task.id,
@@ -1024,6 +1030,7 @@ export class Orchestrator {
       approval: defaults.approval,
       outputSchema: opts.outputSchema,
       resumeSessionId,
+      previousCumulativeUsage,
       timeoutMs: this.deps.globalConfig.workflow.roleTimeoutMs,
       maxCostUsd: this.deps.globalConfig.budgets.maxCostUsdPerTask
     };
@@ -1076,21 +1083,45 @@ export class Orchestrator {
     return { result, providerId: adapter.id };
   }
 
-  private recordAgentUsage(task: TaskRecord, role: string, providerId: string, result: AgentResult): TaskRecord {
+  /**
+   * `operation` distinguishes invocations that share a role but mean
+   * something different for telemetry purposes — concretely, fix() invokes
+   * the same "implementer" role as implement() (see UsageEvent in
+   * @ai-engine/core for why this exists instead of a dedicated workflow
+   * role). `usage`/`agentsUsed`/`roleInvocationCounts` below are pre-existing
+   * task-level bookkeeping (used for budget enforcement) and are untouched;
+   * `usageEvents` is the new, fully-attributed, append-only log that
+   * provider/role/operation breakdowns are derived from. `result.usage` is
+   * always "what this invocation alone consumed" (already converted from any
+   * provider-native cumulative reporting by the adapter itself — see
+   * ObservedUsage/`cumulativeUsageBaseline` — never the raw cumulative number),
+   * so it's safe to log verbatim into `usageEvents` and accumulate into
+   * `usage` below without any further conversion here. `cumulativeUsageBaseline`
+   * is separate, orchestrator-only bookkeeping (persisted onto the session
+   * ref, not into `usageEvents`) so the *next* resume of this exact session
+   * can perform that same conversion correctly.
+   */
+  private recordAgentUsage(task: TaskRecord, role: string, providerId: string, result: AgentResult, operation: string): TaskRecord {
     const alreadyUsed = task.agentsUsed.some((a) => a.role === role && a.providerId === providerId);
     const usage: TaskUsage = { ...task.usage };
     if (result.usage?.costUsd !== undefined) usage.totalCostUsd = (usage.totalCostUsd ?? 0) + result.usage.costUsd;
     if (result.usage?.inputTokens !== undefined) usage.totalInputTokens = (usage.totalInputTokens ?? 0) + result.usage.inputTokens;
     if (result.usage?.outputTokens !== undefined) usage.totalOutputTokens = (usage.totalOutputTokens ?? 0) + result.usage.outputTokens;
 
+    const usageEvent: UsageEvent = { at: new Date().toISOString(), providerId, role, operation, usage: result.usage ?? {} };
+
     return {
       ...task,
       agentsUsed: alreadyUsed ? task.agentsUsed : [...task.agentsUsed, { role, providerId }],
       providerSessions: result.providerSessionId
-        ? { ...task.providerSessions, [role]: { providerId, sessionId: result.providerSessionId } }
+        ? {
+            ...task.providerSessions,
+            [role]: { providerId, sessionId: result.providerSessionId, cumulativeUsageBaseline: result.cumulativeUsageBaseline }
+          }
         : task.providerSessions,
       roleInvocationCounts: { ...task.roleInvocationCounts, [role]: (task.roleInvocationCounts[role] ?? 0) + 1 },
-      usage
+      usage,
+      usageEvents: [...task.usageEvents, usageEvent]
     };
   }
 }

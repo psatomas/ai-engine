@@ -845,3 +845,88 @@ describe("H5 (persistence): legacy or malformed provider sessions on disk are no
     expect(task.workflowState).toBe("AWAITING_APPROVAL");
   });
 });
+
+describe("H6: a cumulative-usage baseline is never handed to a different provider than the one that created it", () => {
+  it("does not leak provider A's cumulative usage baseline to provider B after the implementer role's provider assignment changes mid-task", async () => {
+    const providerA = new MockProvider("providerA", (request) => {
+      if (request.role === "reviewer" || request.role === "security_reviewer") {
+        return {
+          status: "success",
+          structuredOutput: {
+            verdict: "changes_requested",
+            summary: "needs work",
+            findings: [{ dimension: "correctness", severity: "major", summary: "bug", detail: "detail" }]
+          }
+        };
+      }
+      if (request.role === "implementer") {
+        return {
+          status: "success",
+          finalMessage: "Added feature.txt",
+          providerSessionId: "providerA-session-123",
+          usage: { inputTokens: 100 },
+          cumulativeUsageBaseline: { inputTokens: 100 }
+        };
+      }
+      return mockResponder(request);
+    });
+    const providerB = new MockProvider("providerB", () => ({ status: "success", finalMessage: "Fixed" }));
+
+    const sharedDataDir = dataDir;
+    const orchestrator1 = await buildOrchestrator({
+      sharedDataDir,
+      factories: new Map<string, ProviderFactory>([
+        ["providerA", () => providerA],
+        ["providerB", () => providerB]
+      ]),
+      configOverrides: {
+        roles: {
+          architect: { providerId: "providerA" },
+          implementer: { providerId: "providerA" },
+          reviewer: { providerId: "providerA" },
+          security_reviewer: { providerId: "providerA" },
+          verifier: { providerId: "providerA" }
+        }
+      }
+    });
+
+    let task = await orchestrator1.createTask("Add a feature");
+    task = await orchestrator1.run(task.id);
+    task = await orchestrator1.decidePlan(task.id, "approved", "alice");
+    task = await orchestrator1.implement(task.id);
+    task = await orchestrator1.test(task.id);
+    task = await orchestrator1.review(task.id);
+    expect(task.workflowState).toBe("FIXING");
+    expect(task.providerSessions.implementer).toEqual({
+      providerId: "providerA",
+      sessionId: "providerA-session-123",
+      cumulativeUsageBaseline: { inputTokens: 100 }
+    });
+
+    // Simulates the implementer role's provider assignment changing between invocations of the
+    // same task, exactly like H5 — but this time asserting the cumulative-usage baseline (not
+    // just the resume session id) is never carried across the switch.
+    const orchestrator2 = await buildOrchestrator({
+      sharedDataDir,
+      factories: new Map<string, ProviderFactory>([
+        ["providerA", () => providerA],
+        ["providerB", () => providerB]
+      ]),
+      configOverrides: { roles: { implementer: { providerId: "providerB" } } }
+    });
+
+    task = await orchestrator2.fix(task.id);
+
+    expect(providerB.invocations).toHaveLength(1);
+    expect(providerB.invocations[0]!.request.resumeSessionId).toBeUndefined();
+    // The core Finding 2 isolation requirement: providerB must never receive providerA's baseline.
+    expect(providerB.invocations[0]!.request.previousCumulativeUsage).toBeUndefined();
+    // providerA's own recorded session+baseline are untouched by the switch (providerB's result
+    // carries no providerSessionId, so providerSessions is left exactly as it was).
+    expect(task.providerSessions.implementer).toEqual({
+      providerId: "providerA",
+      sessionId: "providerA-session-123",
+      cumulativeUsageBaseline: { inputTokens: 100 }
+    });
+  });
+});

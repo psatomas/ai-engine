@@ -2,6 +2,7 @@ import type { WorkflowState } from "./workflow-state.js";
 import type { VerificationReport } from "./verification.js";
 import type { ReviewReport } from "./review.js";
 import type { DependencySetupResult } from "./dependency-setup.js";
+import type { ObservedUsage, UsageEvent } from "./usage.js";
 
 export interface GitBaseline {
   branch: string;
@@ -76,6 +77,15 @@ export interface RoleAssignment {
 export interface ProviderSessionRef {
   providerId: string;
   sessionId: string;
+  /**
+   * The last raw cumulative usage total observed for this exact session, for providers whose
+   * usage reporting is cumulative-per-thread rather than per-invocation (see
+   * `previousCumulativeUsage`/`cumulativeUsageBaseline` on `AgentInvocationRequest`/`AgentResult`
+   * in provider.ts). Absent for providers that report natural per-invocation deltas, and absent
+   * on any `ProviderSessionRef` persisted before this field existed — both cases are treated
+   * identically (no reliable baseline), never assumed to be zero.
+   */
+  cumulativeUsageBaseline?: ObservedUsage;
 }
 
 /**
@@ -115,4 +125,14 @@ export interface TaskRecord {
   providerSessions: Record<string, ProviderSessionRef>;
   usage: TaskUsage;
   roleInvocationCounts: Record<string, number>;
+  /**
+   * One fully-attributed UsageEvent per agent invocation, append-only —
+   * the source of truth for provider/role/operation-level usage
+   * telemetry. `usage`/`roleInvocationCounts` above are unrelated,
+   * pre-existing task-level totals used for budget enforcement; this is
+   * the finer-grained log task/provider/role/invocation breakdowns are
+   * derived from (see summarizeUsageEvents/groupUsageEvents in usage.ts)
+   * rather than reconstructed from logs.
+   */
+  usageEvents: UsageEvent[];
 }

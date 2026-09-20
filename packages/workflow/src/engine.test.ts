@@ -25,6 +25,7 @@ function makeTask(overrides: Partial<TaskRecord> = {}): TaskRecord {
     providerSessions: {},
     usage: {},
     roleInvocationCounts: {},
+    usageEvents: [],
     ...overrides
   };
 }

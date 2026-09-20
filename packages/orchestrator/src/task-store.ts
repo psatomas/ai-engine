@@ -41,8 +41,13 @@ function normalizeProviderSessions(task: TaskRecord): TaskRecord {
   return sawLegacyEntry ? { ...task, providerSessions: normalized } : task;
 }
 
+/** A record persisted before usage telemetry existed has no `usageEvents` at all — backfill an empty log rather than crash. No history is fabricated; the task simply has no recorded invocations before this field existed. */
+function normalizeUsageEvents(task: TaskRecord): TaskRecord {
+  return Array.isArray(task.usageEvents) ? task : { ...task, usageEvents: [] };
+}
+
 function normalizeLegacyTaskRecord(task: TaskRecord): TaskRecord {
-  return normalizeProviderSessions(task);
+  return normalizeUsageEvents(normalizeProviderSessions(task));
 }
 
 export class TaskRecordCorruptedError extends Error {
