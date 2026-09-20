@@ -97,7 +97,7 @@ export function formatVerificationChecks(checks: Array<VerificationCheck & { app
         c.origin === "repository_configured"
           ? c.approved
             ? " [approved]"
-            : " [NOT APPROVED — run `ai checks <taskId> approve " + c.id + "`]"
+            : " [NOT APPROVED — run `ai approve-check <taskId> " + c.id + "`]"
           : "";
       return `${c.id} (${origin}${c.requiredForReady ? ", required" : ""})${approval}\n    ${c.command}`;
     })

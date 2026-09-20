@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { TaskRecord } from "@ai-engine/core";
-import { formatTaskDetail } from "./format.js";
+import type { TaskRecord, VerificationCheck } from "@ai-engine/core";
+import { formatTaskDetail, formatVerificationChecks } from "./format.js";
 
 function makeTask(overrides: Partial<TaskRecord>): TaskRecord {
   return {
@@ -26,6 +26,22 @@ function makeTask(overrides: Partial<TaskRecord>): TaskRecord {
     ...overrides
   };
 }
+
+describe("formatVerificationChecks", () => {
+  it("points an unapproved repository-configured check at the real `ai approve-check` command, not a nonexistent `ai checks ... approve`", () => {
+    const check: VerificationCheck & { approved: boolean } = {
+      id: "custom.integration",
+      description: "custom integration check",
+      command: "npm run test:integration",
+      requiredForReady: true,
+      origin: "repository_configured",
+      approved: false
+    };
+    const out = formatVerificationChecks([check]);
+    expect(out).toContain("ai approve-check <taskId> custom.integration");
+    expect(out).not.toMatch(/ai checks .*approve/);
+  });
+});
 
 describe("formatTaskDetail's 'Next action' rendering", () => {
   it("TASK_CREATED points at `ai plan`", () => {
