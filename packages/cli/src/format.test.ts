@@ -94,6 +94,29 @@ describe("formatTaskDetail's 'Next action' rendering", () => {
 });
 
 describe("formatProviderSummaries", () => {
+  it.each([
+    [],
+    [{ id: "a" }],
+    [
+      { id: "a", usedFraction: 0 },
+      { id: "b", usedFraction: 1.25 }
+    ]
+  ])("summarizes independent windows without inventing current utilization or blocking", (...windows) => {
+    const summary: ProviderSummary = {
+      id: "acme",
+      displayName: "Acme Agent",
+      capabilities: [],
+      roles: [],
+      availability: { available: true },
+      capacity: { status: "known", windows }
+    };
+    const out = formatProviderSummaries([summary]);
+    expect(out).toContain(`known (${windows.length} quota windows reported)`);
+    expect(out).not.toContain("% remaining");
+    expect(out).not.toContain("blocked");
+    expect(out).toContain("available: true");
+  });
+
   it("renders an empty registry without error", () => {
     expect(formatProviderSummaries([])).toMatch(/no providers registered/);
   });
@@ -120,10 +143,16 @@ describe("formatProviderSummaries", () => {
       capabilities: ["implement"],
       roles: [],
       availability: { available: true },
-      capacity: { status: "known", remainingFraction: 0.5, account: { planLabel: "Pro" }, resetsAt: "2026-01-01T00:00:00.000Z" }
+      capacity: {
+        status: "known",
+        windows: [{ id: "a", usedFraction: 0.5, resetsAt: "2026-01-01T00:00:00.000Z" }],
+        account: { planLabel: "Pro" }
+      }
     };
     const out = formatProviderSummaries([summary]);
-    expect(out).toContain("50% remaining");
+    expect(out).toContain("known (1 quota windows reported)");
+    expect(out).not.toContain("% remaining");
+    expect(out).not.toContain("resets:");
     expect(out).toContain("plan: Pro");
     expect(out).toContain("roles:     (none configured)");
   });
@@ -149,7 +178,7 @@ describe("formatProviderSummaries", () => {
       capabilities: ["implement"],
       roles: ["implementer"],
       availability: { available: true, authenticated: true, version: "1.2.3" },
-      capacity: { status: "known", remainingFraction: 0.5, account: { planLabel: "Pro" } }
+      capacity: { status: "known", windows: [{ id: "a", usedFraction: 0.5 }], account: { planLabel: "Pro" } }
     };
     const zenith: ProviderSummary = {
       id: "zenith",
@@ -157,7 +186,7 @@ describe("formatProviderSummaries", () => {
       capabilities: ["review"],
       roles: ["reviewer", "verifier"],
       availability: { available: true },
-      capacity: { status: "known", remainingFraction: 0.25 }
+      capacity: { status: "known", windows: [{ id: "b", usedFraction: 0.75 }] }
     };
     // Each provider's block starts at a header line (no indentation); everything else is indented.
     const blocks = formatProviderSummaries([acme, zenith]).split(/\n(?=\S)/);
@@ -179,14 +208,14 @@ describe("formatProviderSummaries", () => {
     expect(zenithBlock).not.toContain("plan:");
   });
 
-  it("renders a genuinely exhausted capacity (0% remaining) as known, never as unknown — and unknown as unknown", () => {
+  it("keeps a report containing full utilization distinct from unknown without claiming current capacity", () => {
     const exhausted: ProviderSummary = {
       id: "acme",
       displayName: "Acme Agent",
       capabilities: ["implement"],
       roles: [],
       availability: { available: true },
-      capacity: { status: "known", remainingFraction: 0 }
+      capacity: { status: "known", windows: [{ id: "a", usedFraction: 1 }] }
     };
     const unknown: ProviderSummary = {
       id: "zenith",
@@ -198,7 +227,8 @@ describe("formatProviderSummaries", () => {
     };
     const [exhaustedBlock, unknownBlock] = formatProviderSummaries([exhausted, unknown]).split(/\n(?=\S)/) as [string, string];
 
-    expect(exhaustedBlock).toContain("0% remaining");
+    expect(exhaustedBlock).toContain("known (1 quota windows reported)");
+    expect(exhaustedBlock).not.toContain("% remaining");
     expect(exhaustedBlock).not.toContain("unknown");
     expect(unknownBlock).toContain("capacity:  unknown");
     expect(unknownBlock).not.toContain("0% remaining");

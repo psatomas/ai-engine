@@ -123,7 +123,7 @@ describe("Orchestrator.listProviders()", () => {
   it("reflects a real getCapacity() result when a provider implements it", async () => {
     class CapacityReportingProvider extends MockProvider {
       async getCapacity(): Promise<ProviderCapacityInfo> {
-        return { status: "known", remainingFraction: 0.42, account: { planLabel: "Pro" } };
+        return { status: "known", windows: [{ id: "a", usedFraction: 0.58 }, { id: "b" }], account: { planLabel: "Pro" } };
       }
     }
     const reporting = new CapacityReportingProvider("acme", () => ({ status: "success" }));
@@ -134,7 +134,11 @@ describe("Orchestrator.listProviders()", () => {
     const orchestrator = await buildOrchestrator(factories);
     const summaries = await orchestrator.listProviders();
     const acme = summaries.find((s) => s.id === "acme")!;
-    expect(acme.capacity).toEqual({ status: "known", remainingFraction: 0.42, account: { planLabel: "Pro" } });
+    expect(acme.capacity).toEqual({
+      status: "known",
+      windows: [{ id: "a", usedFraction: 0.58 }, { id: "b" }],
+      account: { planLabel: "Pro" }
+    });
   });
 
   it("a provider whose getCapacity() rejects is still listed with unknown capacity and the failure detail, and the others are unaffected", async () => {

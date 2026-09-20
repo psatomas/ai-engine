@@ -85,10 +85,9 @@ export function formatProviderSummaries(summaries: ProviderSummary[]): string {
 
 function formatCapacity(capacity: ProviderSummary["capacity"]): string {
   if (capacity.status === "unknown") return `unknown${capacity.detail ? ` (${capacity.detail})` : ""}`;
-  const parts: string[] = ["known"];
-  if (capacity.remainingFraction !== undefined) parts.push(`${Math.round(capacity.remainingFraction * 100)}% remaining`);
+  // Transitional summary only: window values may be historical. Detailed presentation is separate.
+  const parts: string[] = [`known (${capacity.windows.length} quota windows reported)`];
   if (capacity.account?.planLabel) parts.push(`plan: ${capacity.account.planLabel}`);
-  if (capacity.resetsAt) parts.push(`resets: ${capacity.resetsAt}`);
   return parts.join(", ");
 }
 

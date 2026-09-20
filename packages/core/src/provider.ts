@@ -107,20 +107,46 @@ export interface ProviderAccountInfo {
   planLabel?: string;
 }
 
-/**
- * Normalized provider/account capacity (quota) info. `"unknown"` is a
- * first-class, expected value: an adapter with no reliable figure reports
- * `{ status: "unknown" }` (or simply omits `getCapacity()`), so that the
- * absence of real data is represented explicitly rather than papered over
- * with an invented number.
- */
-export interface ProviderCapacityInfo {
-  status: "known" | "unknown";
-  account?: ProviderAccountInfo;
-  /** Only meaningful when status === "known". 0..1, remaining fraction of quota. */
-  remainingFraction?: number;
+/** A single independently reported quota window, not an execution/availability verdict. */
+export interface CapacityWindow {
+  /** Opaque identity unique within this provider's report; consumers must not infer duration from it. */
+  id: string;
+  /** Optional human-readable name, separate from identity. */
+  label?: string;
+  /** Reported window length in seconds, when known; never inferred from id. */
+  durationSeconds?: number;
+  /**
+   * Historical observed utilization: undefined is unknown, 0 is genuinely unused, and 1 is
+   * fully used. Finite nonnegative values above 1 preserve reported overage. Producers must
+   * validate external values; TypeScript's number type alone does not enforce this contract.
+   * Utilization does not establish execution blocking, authentication, or availability.
+   */
+  usedFraction?: number;
+  /** ISO 8601 time the evidence was observed/recorded, NOT the time AI Engine read it. */
+  observedAt?: string;
+  /** Reported ISO 8601 reset time; its passage never changes the observed utilization. */
   resetsAt?: string;
+}
+
+/**
+ * A known report describes zero or more independent windows; individual utilization may still
+ * be unknown. Neither "known" nor a timestamp asserts freshness or current usable allowance.
+ * Unknown capacity remains an expected result for adapters with no capacity information.
+ * There is deliberately no provider-wide aggregate fraction or reset timestamp.
+ */
+export type ProviderCapacityInfo = {
+  account?: ProviderAccountInfo;
   detail?: string;
+} & ({ status: "known"; windows: CapacityWindow[] } | { status: "unknown"; windows?: never });
+
+/**
+ * Derives remaining quota from a single observed utilization, not current capacity. Invalid
+ * utilization stays unknown; overage remains intact on the observation but has zero remainder.
+ * No clock, reset, window aggregation, or execution-blocking policy is involved.
+ */
+export function remainingCapacityFraction(usedFraction: number | undefined): number | undefined {
+  if (usedFraction === undefined || !Number.isFinite(usedFraction) || usedFraction < 0) return undefined;
+  return Math.max(0, 1 - usedFraction);
 }
 
 export const UNKNOWN_PROVIDER_CAPACITY: ProviderCapacityInfo = { status: "unknown" };
