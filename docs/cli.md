@@ -82,11 +82,29 @@ ai diff <taskId>
     Print the task's current diff against its baseline commit; warns if any changed path matches
     the suspicious-path list (see docs/security.md).
 
+ai usage <taskId>
+    Show the usage the task's agent invocations reported, grouped by provider and then role (`fix`
+    invocations of the implementer role are listed separately, as "fixer"), followed by a task total
+    with invocation and provider counts. Read-only: it only reads the usage log persisted on the task.
+    An invocation that reported no usage still counts as an invocation and is shown as
+    "(no usage metrics reported)" — never as 0 — while a value a provider genuinely reported as 0 is
+    shown as 0. A task with no recorded invocations prints "(no recorded usage for this task)". See
+    docs/providers.md#usage--capacity.
+
 ai config path
     Print the resolved global config/data directories for this machine.
 
 ai config show
     Print the effective global configuration (defaults merged with your config.yaml) as JSON.
+
+ai providers
+    List every registered provider generically — id, display name, which configured roles currently
+    resolve to it, availability (installed / authenticated / version, plus the detail of any failure),
+    capabilities, and capacity. Capacity is "unknown" for every provider today: neither shipped provider
+    reports it (see docs/providers.md#usage--capacity). Read-only: it runs each provider's availability
+    diagnostics (version and auth-status probes) and nothing else — it never invokes an agent, creates a
+    task, or opens a session. Never hardcodes which providers exist; reflects whatever's registered in
+    RoleRegistry's factory map (see docs/adding-a-provider.md).
 ```
 
 ## Guided mode (`ai start`)

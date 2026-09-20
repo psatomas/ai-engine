@@ -176,6 +176,92 @@ findings that `fix()` marked `fix_attempted` (never `fixed`), which a subsequent
 round then confirmed resolved on its own — not by trusting the earlier mark. No new AI Engine
 defects were found on this run.
 
+## Session/provider binding
+
+`TaskRecord.providerSessions` (`packages/core/src/task.ts`) stores, per role, a
+`ProviderSessionRef { providerId, sessionId, cumulativeUsageBaseline? }` — never a bare session id.
+`Orchestrator.buildRequest` only forwards `resumeSessionId` (and the usage baseline — see
+[Observed usage](#observed-usage) below) when the role's _currently resolved_ provider id matches the one
+recorded on the session. This matters because a role's provider assignment can change between two
+invocations of the same task (an edited global/project config, an override introduced mid-task): without
+the binding, the newly-assigned provider would be handed a native resume/session id created by a
+completely different product, which is meaningless (and potentially unsafe) input to that product's own
+`--resume`/`--session-id` flag. See `packages/orchestrator/src/orchestrator.hardening.test.ts`'s "H5"
+block for a reproduction across two providers sharing a task, and "H6" for the same isolation applied to
+the usage baseline.
+
+Persisted sessions are validated when a task is loaded (`TaskStore.get()`). A record written before this
+binding existed had a bare string there; that entry is dropped rather than guessed at, because there is no
+way to know which provider created it. So is any entry whose `providerId` or `sessionId` is not a non-empty
+string (values are never coerced into shape), and a record whose `providerSessions` is missing or not an
+object is given an empty one. In every case the next invocation of that role simply starts a fresh
+session instead of resuming, which is always the safe direction.
+
+## Usage & capacity
+
+Two genuinely different things are both called "usage" and are kept separate on purpose: what an
+invocation _reported consuming_ (observed usage), and how much of an account's allowance _remains_
+(capacity).
+
+### Observed usage
+
+- **Shape.** `AgentResult.usage` is an `ObservedUsage` (`packages/core/src/usage.ts`), every dimension
+  optional: `inputTokens`, `cachedInputTokens`, `cacheWriteInputTokens`, `outputTokens`,
+  `reasoningOutputTokens`, `costUsd`. A dimension a provider doesn't report is `undefined` — never `0` — so
+  "unknown" and "genuinely zero" are never conflated; a reported `0` is a real, known value.
+- **Validation.** Provider JSON is untrusted. Token counts must be finite, non-negative integers and cost
+  finite and non-negative; a malformed dimension is omitted on its own (never coerced to `0`), and a result
+  with no valid dimension reports `usage` as `undefined`.
+- **Per-invocation record.** Every provider invocation — including one whose usage is unknown — appends one
+  `UsageEvent { at, providerId, role, operation, usage }` to the append-only `TaskRecord.usageEvents`.
+  `operation` is `analyze`, `implement`, `review`, `fix` or `verify`, which is what distinguishes `fix()`
+  from `implement()` on the same `implementer` role. An invocation with unknown usage is recorded with
+  `usage: {}`, so invocation counts are complete. Totals by provider, role or task are always derived from
+  these events (`summarizeUsageEvents`, `groupUsageEvents`), never stored separately. A task record written
+  before the log existed loads with an empty one; no history is invented. `TaskRecord.usage` (`TaskUsage` —
+  cost/input/output totals) is a separate, older tally, is what budget enforcement reads, and is unchanged.
+- **Claude** reports usage on the stream's `result` message: input, output, cache-read and cache-write
+  tokens, and `total_cost_usd`. These are per-invocation values. Claude does not report reasoning tokens
+  separately, so that dimension is never set.
+- **Codex** reports usage only on `turn.completed`, as a _cumulative_ per-thread snapshot rather than a
+  per-invocation delta (confirmed live with a chained fresh → resume run: cached input tokens exactly
+  doubled). The last snapshot is authoritative and snapshots are never summed; the compatibility
+  `token_count` events are ignored, so repeated rate-limit notifications can't double-count. On a fresh
+  invocation the snapshot _is_ the invocation's usage; on a resumed one it is the difference from the
+  previous snapshot (`AgentInvocationRequest.previousCumulativeUsage`), and is left unknown when there is
+  no reliable baseline. The raw snapshot is returned as `AgentResult.cumulativeUsageBaseline`; the
+  orchestrator stores it on that role's `ProviderSessionRef` and passes it back only to the same provider's
+  same session. If a call returns a session but no usage snapshot, the stored baseline is cleared rather
+  than left stale, so the next resume reports unknown usage instead of an inflated number. Codex reports no
+  cost.
+- `ai usage <taskId>` presents this — see [cli.md](./cli.md).
+
+### Provider capacity
+
+- `ProviderAdapter.getCapacity?(): Promise<ProviderCapacityInfo>` (`packages/core/src/provider.ts`) is an
+  **optional** method. `ProviderCapacityInfo` is
+  `{ status: "known" | "unknown", account?, remainingFraction?, resetsAt?, detail? }`. `"unknown"`
+  (`UNKNOWN_PROVIDER_CAPACITY`) is a first-class, expected value, not an error state, and an adapter
+  without `getCapacity()` is treated exactly as if it returned it. Capacity is never inferred from token
+  counts or invocation behavior, and `account.planLabel` is only ever set from something the provider
+  itself states — a subscription tier is account/capacity metadata, never a separate provider id.
+- **Neither `ClaudeProvider` nor `CodexProvider` implements `getCapacity()`.** Nothing in AI Engine
+  currently reads capacity for either shipped provider (the `auth status` / `login status` probes described
+  above are used only for availability), so `listProviders()` and `ai providers` report
+  `{ status: "unknown" }` for both — honestly, rather than fabricating a number.
+- **Enumeration.** `RoleRegistry.describeProviders()` and `Orchestrator.listProviders()` iterate the factory
+  map `adapterForRole()` uses, never a hardcoded id list, and return one
+  `ProviderSummary { id, displayName, capabilities, roles, availability, capacity }` per registered
+  provider. `roles` lists the configured roles (global and project) whose _effective_ assignment — a project
+  override wins — resolves to that provider; a role assigned to a provider id that isn't registered appears
+  under no provider.
+- **Failures.** If a provider's `checkAvailability()` rejects, it is listed as unavailable; if its
+  `getCapacity()` rejects, its capacity is listed as unknown — each with the error message as `detail` —
+  and the other providers are still listed. Only asynchronous (rejected-promise) failures are contained: a
+  synchronous throw from either method, or a provider factory that throws, rejects the whole call.
+- This is a read-only reporting contract, not routing: nothing selects a provider based on capacity or
+  usage.
+
 ## Sandbox level → provider flag mapping
 
 | `SandboxLevel`    | Codex `-s`           | Claude tool policy                                        |

@@ -65,6 +65,21 @@ Dependency direction is strictly one-way: `core` depends on nothing of ours; `wo
   interface is the only thing `orchestrator/` programs against. `RoleRegistry`
   (`packages/orchestrator/src/role-registry.ts`) is the _only_ place a provider id string is mapped
   to a concrete class. See [adding-a-provider.md](./adding-a-provider.md).
+- **Provider enumeration is generic too.** `RoleRegistry.describeProviders()` and
+  `Orchestrator.listProviders()` iterate the same factory map `adapterForRole()` uses — never a
+  hardcoded id list — returning each provider's identity/capabilities, which configured roles resolve
+  to it, live availability, and capacity (`ProviderCapacityInfo`, explicitly `"unknown"` when a
+  provider has nothing reliable to report — see [providers.md](./providers.md#usage--capacity)). This
+  is what lets the CLI's `ai providers` present whatever providers are registered without
+  special-casing Claude/Codex. It is a read-only report: nothing selects a provider from it.
+- **Usage is observed, normalized, and recorded per invocation.** Each adapter reports what an
+  invocation actually consumed as a provider-independent `ObservedUsage` (a dimension it doesn't report
+  stays `undefined`, never `0`), and the orchestrator appends one `UsageEvent` (provider, role,
+  operation) per invocation to the task record; totals — what `ai usage` shows — are derived from those
+  events rather than stored separately. Resumed sessions are bound to the provider that created them:
+  `TaskRecord.providerSessions` holds one `ProviderSessionRef` per role (provider id, session id, and an
+  optional cumulative-usage baseline), and a session id or usage baseline is only ever handed back to that
+  same provider. See [providers.md](./providers.md#sessionprovider-binding).
 - **Git is a safety boundary, not a side effect.** Every task gets its own worktree + branch, created
   from a captured baseline commit, before any agent runs. See [git behavior](./architecture.md#git-worktree-behavior)
   below and [security.md](./security.md).
