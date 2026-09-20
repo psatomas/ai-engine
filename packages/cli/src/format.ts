@@ -1,4 +1,69 @@
-import type { ReviewFinding, TaskRecord, VerificationCheck, VerificationResult } from "@ai-engine/core";
+import type { ReviewFinding, TaskRecord, UsageEvent, UsageTotals, VerificationCheck, VerificationResult } from "@ai-engine/core";
+import { groupUsageEvents, summarizeUsageEvents } from "@ai-engine/core";
+
+/**
+ * `fix()` invokes the same "implementer" role as `implement()` (see
+ * UsageEvent in @ai-engine/core) — this is the one place that distinction
+ * becomes a human-readable "fixer" label. It's a presentation choice, not a
+ * schema or workflow concept: no new role exists anywhere else.
+ */
+function usageDisplayLabel(role: string, operation: string): string {
+  return role === "implementer" && operation === "fix" ? "fixer" : role;
+}
+
+function formatUsageMetrics(totals: UsageTotals): string {
+  const metrics: string[] = [];
+  if (totals.inputTokens !== undefined) metrics.push(`input: ${totals.inputTokens.toLocaleString()}`);
+  if (totals.cachedInputTokens !== undefined) metrics.push(`cached: ${totals.cachedInputTokens.toLocaleString()}`);
+  if (totals.cacheWriteInputTokens !== undefined) metrics.push(`cache-write: ${totals.cacheWriteInputTokens.toLocaleString()}`);
+  if (totals.outputTokens !== undefined) metrics.push(`output: ${totals.outputTokens.toLocaleString()}`);
+  if (totals.reasoningOutputTokens !== undefined) metrics.push(`reasoning: ${totals.reasoningOutputTokens.toLocaleString()}`);
+  if (totals.costUsd !== undefined) metrics.push(`cost: $${totals.costUsd.toFixed(4)}`);
+  return metrics.length ? metrics.join(", ") : "(no usage metrics reported)";
+}
+
+function formatInvocations(n: number): string {
+  return `${n} invocation${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * The provider -> role/operation usage breakdown (`ai usage <taskId>`).
+ * Never fabricates a `0` for an unreported metric — a bucket with
+ * invocations but no numeric usage says so explicitly rather than printing
+ * blanks or zeros (see ObservedUsage's "unknown, not zero" contract).
+ * Totals/counts are derived from `task.usageEvents` via @ai-engine/core's
+ * generic `groupUsageEvents`/`summarizeUsageEvents` — never recomputed from
+ * logs, and with no Claude/Codex-specific knowledge beyond the one "fixer"
+ * display label above.
+ */
+export function formatTaskUsage(task: TaskRecord): string {
+  if (task.usageEvents.length === 0) return "(no recorded usage for this task)";
+
+  const byProvider = new Map<string, UsageEvent[]>();
+  for (const event of task.usageEvents) {
+    const bucket = byProvider.get(event.providerId);
+    if (bucket) bucket.push(event);
+    else byProvider.set(event.providerId, [event]);
+  }
+
+  const lines: string[] = [];
+  for (const providerId of [...byProvider.keys()].sort()) {
+    const events = byProvider.get(providerId)!;
+    lines.push(providerId);
+    const byLabel = groupUsageEvents(events, (e) => usageDisplayLabel(e.role, e.operation));
+    for (const label of Object.keys(byLabel).sort()) {
+      const totals = byLabel[label]!;
+      lines.push(`  ${label.padEnd(19)} ${formatInvocations(totals.invocations)} — ${formatUsageMetrics(totals)}`);
+    }
+    lines.push("");
+  }
+
+  const total = summarizeUsageEvents(task.usageEvents);
+  lines.push(
+    `Task total: ${formatInvocations(total.invocations)} across ${byProvider.size} provider${byProvider.size === 1 ? "" : "s"} — ${formatUsageMetrics(total)}`
+  );
+  return lines.join("\n").trimEnd();
+}
 
 export function formatTaskLine(task: TaskRecord): string {
   return `${task.id}  [${task.workflowState}]  ${truncate(task.originalRequest, 60)}`;

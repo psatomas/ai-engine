@@ -11,7 +11,14 @@ import {
 } from "@ai-engine/orchestrator";
 import { resolveEnginePaths, loadGlobalConfig } from "@ai-engine/config";
 import { TaskLockedError } from "@ai-engine/security";
-import { formatFindings, formatTaskDetail, formatTaskLine, formatVerificationChecks, formatVerificationResults } from "./format.js";
+import {
+  formatFindings,
+  formatTaskDetail,
+  formatTaskLine,
+  formatTaskUsage,
+  formatVerificationChecks,
+  formatVerificationResults
+} from "./format.js";
 import { runGuided, createRealIO, NonInteractiveApprovalRequiredError } from "./guided.js";
 
 const program = new Command();
@@ -329,6 +336,22 @@ program
         if (tasks.length === 0) console.log('(no tasks yet — try `ai task "<request>"`)');
         for (const t of tasks) console.log(formatTaskLine(t));
       }
+    } catch (err) {
+      fail(err);
+    }
+  });
+
+program
+  .command("usage <taskId>")
+  .description(
+    "Show observed usage for a task, broken down by provider and role (fixer invocations shown separately from implementer) — derived from persisted per-invocation telemetry, never reconstructed from logs"
+  )
+  .action(async (taskId: string) => {
+    try {
+      const orchestrator = await createOrchestrator(process.cwd());
+      const task = await orchestrator.getTask(taskId);
+      if (!task) throw new Error(`Unknown task "${taskId}"`);
+      console.log(formatTaskUsage(task));
     } catch (err) {
       fail(err);
     }
