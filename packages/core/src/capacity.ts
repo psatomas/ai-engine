@@ -5,6 +5,25 @@ export interface CapacityFreshnessPolicy {
   maxAgeMs: number;
 }
 
+/**
+ * Policy-independent interpretation of one capacity window at an explicit clock. Deliberately
+ * contains no freshness, acceptable-age, or usability concept: those exist only once a caller
+ * supplies a freshness policy (see `evaluateCapacityWindow`). Nothing here is an execution,
+ * routing, or availability verdict.
+ */
+export interface CapacityWindowFacts {
+  utilization: "valid" | "unknown" | "invalid";
+  /** Historical remainder derived from valid utilization; never a replenishment prediction. */
+  remainingFraction?: number;
+  /** Whether the window reports a syntactically valid observation time, none, or a malformed one. */
+  observation: "reported" | "absent" | "invalid";
+  /** `nowMs - observedAtMs`, signed and unclamped; negative means the observation time is in the future. */
+  observationAgeMs?: number;
+  reset: "future" | "passed" | "unknown" | "invalid";
+  /** `resetsAtMs - nowMs`, signed and unclamped; zero (like any non-positive value) corresponds to `passed`. */
+  msUntilReset?: number;
+}
+
 export interface EvaluatedCapacityWindow {
   /** Original historical evidence, never mutated by evaluation. */
   window: CapacityWindow;
@@ -48,10 +67,60 @@ function timestampMs(value: string): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+function assertRepresentableClock(nowMs: number): void {
+  if (!Number.isFinite(nowMs) || !Number.isFinite(new Date(nowMs).getTime())) {
+    throw new RangeError("nowMs must be a finite representable Unix-millisecond timestamp");
+  }
+}
+
+/**
+ * Pure, policy-independent interpretation of a window at an explicit Unix-millisecond clock.
+ * Invalid `nowMs` throws RangeError; missing or malformed evidence is represented in the result,
+ * never thrown. There is no implicit clock.
+ *
+ * A syntactically valid observation time in the future stays `reported` with a negative signed
+ * age — declaring that evidence invalid is a freshness judgement and belongs to the evaluator.
+ * Both signed offsets are unclamped. A reset at exactly `nowMs` is `passed` with `msUntilReset`
+ * of zero. Window duration and reset time never feed any observation judgement here.
+ */
+export function describeCapacityWindow(window: CapacityWindow, nowMs: number): CapacityWindowFacts {
+  assertRepresentableClock(nowMs);
+
+  const remainingFraction = remainingCapacityFraction(window.usedFraction);
+  const utilization = window.usedFraction === undefined ? "unknown" : remainingFraction === undefined ? "invalid" : "valid";
+
+  let observation: CapacityWindowFacts["observation"] = "absent";
+  let observationAgeMs: number | undefined;
+  if (window.observedAt !== undefined) {
+    const observedMs = timestampMs(window.observedAt);
+    if (observedMs === undefined) observation = "invalid";
+    else {
+      observation = "reported";
+      observationAgeMs = nowMs - observedMs;
+    }
+  }
+
+  let reset: CapacityWindowFacts["reset"] = "unknown";
+  let msUntilReset: number | undefined;
+  if (window.resetsAt !== undefined) {
+    const resetMs = timestampMs(window.resetsAt);
+    if (resetMs === undefined) reset = "invalid";
+    else {
+      msUntilReset = resetMs - nowMs;
+      reset = resetMs <= nowMs ? "passed" : "future";
+    }
+  }
+
+  return { utilization, remainingFraction, observation, observationAgeMs, reset, msUntilReset };
+}
+
 /**
  * Pure evaluation at an explicit Unix-millisecond clock. Invalid clock/policy inputs throw
  * RangeError; missing or malformed evidence is represented in the result. No clock-skew grace
  * is assumed. Window duration never supplies a freshness threshold.
+ *
+ * Policy-independent interpretation comes from `describeCapacityWindow`; this function only
+ * layers the caller's freshness policy and the resulting `usable` verdict on top of those facts.
  *
  * Missing reset information remains unknown and does not invalidate otherwise fresh evidence.
  * Only a passed or invalid reset prevents usability; unknown does not assert that no reset
@@ -60,31 +129,17 @@ function timestampMs(value: string): number | undefined {
  * unblocked, or appropriate for any role.
  */
 export function evaluateCapacityWindow(window: CapacityWindow, nowMs: number, policy: CapacityFreshnessPolicy): EvaluatedCapacityWindow {
-  if (!Number.isFinite(nowMs) || !Number.isFinite(new Date(nowMs).getTime())) {
-    throw new RangeError("nowMs must be a finite representable Unix-millisecond timestamp");
-  }
+  assertRepresentableClock(nowMs);
   if (!Number.isFinite(policy.maxAgeMs) || policy.maxAgeMs <= 0) {
     throw new RangeError("maxAgeMs must be finite and greater than zero");
   }
 
-  const remainingFraction = remainingCapacityFraction(window.usedFraction);
-  const utilization = window.usedFraction === undefined ? "unknown" : remainingFraction === undefined ? "invalid" : "valid";
+  const { utilization, remainingFraction, observation, observationAgeMs, reset } = describeCapacityWindow(window, nowMs);
 
-  let observationAgeMs: number | undefined;
   let freshness: EvaluatedCapacityWindow["freshness"] = "unknown";
-  if (window.observedAt !== undefined) {
-    const observedMs = timestampMs(window.observedAt);
-    if (observedMs === undefined) freshness = "invalid";
-    else {
-      observationAgeMs = nowMs - observedMs;
-      freshness = observationAgeMs < 0 ? "invalid" : observationAgeMs < policy.maxAgeMs ? "fresh" : "stale";
-    }
-  }
-
-  let reset: EvaluatedCapacityWindow["reset"] = "unknown";
-  if (window.resetsAt !== undefined) {
-    const resetMs = timestampMs(window.resetsAt);
-    reset = resetMs === undefined ? "invalid" : resetMs <= nowMs ? "passed" : "future";
+  if (observation === "invalid") freshness = "invalid";
+  else if (observation === "reported") {
+    freshness = observationAgeMs! < 0 ? "invalid" : observationAgeMs! < policy.maxAgeMs ? "fresh" : "stale";
   }
 
   return {
