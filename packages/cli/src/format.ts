@@ -1,6 +1,16 @@
-import type { ReviewFinding, TaskRecord, UsageEvent, UsageTotals, VerificationCheck, VerificationResult } from "@ai-engine/core";
+import type {
+  CapacityFreshnessPolicy,
+  ReviewFinding,
+  TaskRecord,
+  UsageEvent,
+  UsageTotals,
+  VerificationCheck,
+  VerificationResult
+} from "@ai-engine/core";
 import { groupUsageEvents, summarizeUsageEvents } from "@ai-engine/core";
 import type { ProviderSummary } from "@ai-engine/orchestrator";
+import { formatCapacity, USABLE_EVIDENCE_LEGEND } from "./capacity-format.js";
+import { DETAIL_MAX_CHARS, LABEL_MAX_CHARS, sanitizeDisplayText } from "./sanitize.js";
 
 /**
  * `fix()` invokes the same "implementer" role as `implement()` (see
@@ -66,29 +76,40 @@ export function formatTaskUsage(task: TaskRecord): string {
   return lines.join("\n").trimEnd();
 }
 
-export function formatProviderSummaries(summaries: ProviderSummary[]): string {
-  if (summaries.length === 0) return "(no providers registered)";
-  return summaries
-    .map((p) => {
-      const lines = [
-        `${p.id}  (${p.displayName})`,
-        `    available: ${p.availability.available}${p.availability.authenticated !== undefined ? `, authenticated: ${p.availability.authenticated}` : ""}${p.availability.version ? `, version: ${p.availability.version}` : ""}`,
-        `    capacity:  ${formatCapacity(p.capacity)}`,
-        `    roles:     ${p.roles.length ? p.roles.join(", ") : "(none configured)"}`,
-        `    capabilities: ${p.capabilities.join(", ")}`
-      ];
-      if (p.availability.detail) lines.push(`    detail:    ${p.availability.detail}`);
-      return lines.join("\n");
-    })
-    .join("\n");
+export interface ProviderFormatOptions {
+  /** The single clock reading for this whole run; taken once by the caller and never re-read while formatting. */
+  nowMs: number;
+  /** Explicit caller-supplied freshness policy. Without one, no freshness or evidence-usability verdict is shown. */
+  freshnessPolicy?: CapacityFreshnessPolicy;
 }
 
-function formatCapacity(capacity: ProviderSummary["capacity"]): string {
-  if (capacity.status === "unknown") return `unknown${capacity.detail ? ` (${capacity.detail})` : ""}`;
-  // Transitional summary only: window values may be historical. Detailed presentation is separate.
-  const parts: string[] = [`known (${capacity.windows.length} quota windows reported)`];
-  if (capacity.account?.planLabel) parts.push(`plan: ${capacity.account.planLabel}`);
-  return parts.join(", ");
+/**
+ * `ai providers`: identity, availability, capacity windows, roles and capabilities per provider,
+ * generically — no provider or window name is recognized. Every string that originates outside this
+ * process (ids, labels, versions, roles, diagnostic details) is sanitized for terminal output at this
+ * boundary, on a copy; the summaries themselves are never modified. Capacity is presentation only and
+ * never feeds availability, selection, or any other behavior.
+ */
+export function formatProviderSummaries(summaries: ProviderSummary[], options: ProviderFormatOptions): string {
+  if (summaries.length === 0) return "(no providers registered)";
+  const label = (text: string): string => sanitizeDisplayText(text, LABEL_MAX_CHARS);
+  const detail = (text: string): string => sanitizeDisplayText(text, DETAIL_MAX_CHARS);
+  let evaluatedWindows = 0;
+  const blocks = summaries.map((p) => {
+    const capacity = formatCapacity(p.capacity, options);
+    evaluatedWindows += capacity.evaluatedWindows;
+    const lines = [
+      `${label(p.id)}  (${label(p.displayName)})`,
+      `    available: ${p.availability.available}${p.availability.authenticated !== undefined ? `, authenticated: ${p.availability.authenticated}` : ""}${p.availability.version ? `, version: ${label(p.availability.version)}` : ""}`,
+      ...capacity.lines,
+      `    roles:     ${p.roles.length ? p.roles.map(label).join(", ") : "(none configured)"}`,
+      `    capabilities: ${p.capabilities.map(label).join(", ")}`
+    ];
+    if (p.availability.detail) lines.push(`    detail:    ${detail(p.availability.detail)}`);
+    return lines.join("\n");
+  });
+  const output = blocks.join("\n");
+  return evaluatedWindows > 0 ? `${output}\n\n${USABLE_EVIDENCE_LEGEND}` : output;
 }
 
 export function formatTaskLine(task: TaskRecord): string {

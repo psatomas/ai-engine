@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { TaskRecord, UsageEvent, VerificationCheck } from "@ai-engine/core";
+import type { CapacityWindow, ProviderCapacityInfo, TaskRecord, UsageEvent, VerificationCheck } from "@ai-engine/core";
 import type { ProviderSummary } from "@ai-engine/orchestrator";
 import { formatProviderSummaries, formatTaskDetail, formatTaskUsage, formatVerificationChecks } from "./format.js";
 
@@ -94,102 +94,87 @@ describe("formatTaskDetail's 'Next action' rendering", () => {
 });
 
 describe("formatProviderSummaries", () => {
-  it.each([
-    [],
-    [{ id: "a" }],
-    [
-      { id: "a", usedFraction: 0 },
-      { id: "b", usedFraction: 1.25 }
-    ]
-  ])("summarizes independent windows without inventing current utilization or blocking", (...windows) => {
-    const summary: ProviderSummary = {
-      id: "acme",
-      displayName: "Acme Agent",
-      capabilities: [],
-      roles: [],
-      availability: { available: true },
-      capacity: { status: "known", windows }
-    };
-    const out = formatProviderSummaries([summary]);
-    expect(out).toContain(`known (${windows.length} quota windows reported)`);
-    expect(out).not.toContain("% remaining");
-    expect(out).not.toContain("blocked");
-    expect(out).toContain("available: true");
+  const nowMs = Date.parse("2026-09-21T12:00:00.000Z");
+  const iso = (ms: number): string => new Date(ms).toISOString();
+  const chr = (code: number): string => String.fromCharCode(code);
+  const ESC = chr(27);
+  const hasControl = (text: string): boolean =>
+    Array.from(text).some((char) => {
+      const code = char.codePointAt(0)!;
+      return code < 32 || (code >= 127 && code <= 159);
+    });
+  const observed = (usedFraction: number | undefined, id = "w"): CapacityWindow => ({
+    id,
+    usedFraction,
+    observedAt: iso(nowMs - 600_000),
+    resetsAt: iso(nowMs + 7_200_000)
   });
+  const summary = (overrides: Partial<ProviderSummary> = {}): ProviderSummary => ({
+    id: "acme",
+    displayName: "Acme Agent",
+    capabilities: [],
+    roles: [],
+    availability: { available: true },
+    capacity: { status: "unknown" },
+    ...overrides
+  });
+  const format = (summaries: ProviderSummary[], freshnessPolicy?: { maxAgeMs: number }): string =>
+    formatProviderSummaries(summaries, { nowMs, freshnessPolicy });
 
   it("renders an empty registry without error", () => {
-    expect(formatProviderSummaries([])).toMatch(/no providers registered/);
+    expect(format([])).toMatch(/no providers registered/);
+    expect(format([], { maxAgeMs: 900_000 })).toBe("(no providers registered)");
   });
 
   it("renders unknown capacity explicitly rather than omitting it", () => {
-    const summary: ProviderSummary = {
-      id: "acme",
-      displayName: "Acme Agent",
-      capabilities: ["implement", "file_modification"],
-      roles: ["implementer"],
-      availability: { available: true, authenticated: true, version: "1.2.3" },
-      capacity: { status: "unknown" }
-    };
-    const out = formatProviderSummaries([summary]);
+    const out = format([
+      summary({
+        capabilities: ["implement", "file_modification"],
+        roles: ["implementer"],
+        availability: { available: true, authenticated: true, version: "1.2.3" }
+      })
+    ]);
     expect(out).toContain("acme");
     expect(out).toContain("capacity:  unknown");
     expect(out).toContain("roles:     implementer");
+    expect(out).toContain("capabilities: implement, file_modification");
+    expect(out).toContain("available: true, authenticated: true, version: 1.2.3");
   });
 
-  it("renders known capacity details, including a plan label reported by the provider itself", () => {
-    const summary: ProviderSummary = {
-      id: "acme",
-      displayName: "Acme Agent",
-      capabilities: ["implement"],
-      roles: [],
-      availability: { available: true },
-      capacity: {
-        status: "known",
-        windows: [{ id: "a", usedFraction: 0.5, resetsAt: "2026-01-01T00:00:00.000Z" }],
-        account: { planLabel: "Pro" }
-      }
-    };
-    const out = formatProviderSummaries([summary]);
-    expect(out).toContain("known (1 quota windows reported)");
-    expect(out).not.toContain("% remaining");
-    expect(out).not.toContain("resets:");
-    expect(out).toContain("plan: Pro");
+  it("renders known capacity as its windows, with the plan label the provider itself reported", () => {
+    const out = format([
+      summary({
+        capacity: { status: "known", windows: [observed(0.5)], account: { planLabel: "Pro" } }
+      })
+    ]);
+    expect(out).toContain("capacity:  known, 1 window, plan: Pro");
+    expect(out).toContain("50% used, 50% remaining (as observed)");
     expect(out).toContain("roles:     (none configured)");
+    expect(out).not.toContain("quota windows reported");
   });
 
   it("surfaces an availability failure detail instead of hiding it", () => {
-    const summary: ProviderSummary = {
-      id: "acme",
-      displayName: "Acme Agent",
-      capabilities: [],
-      roles: [],
-      availability: { available: false, detail: "binary not found" },
-      capacity: { status: "unknown" }
-    };
-    const out = formatProviderSummaries([summary]);
+    const out = format([summary({ availability: { available: false, detail: "binary not found" } })]);
     expect(out).toContain("available: false");
     expect(out).toContain("detail:    binary not found");
   });
 
-  it("renders every provider with its own roles, and omits optional metadata the provider did not supply", () => {
-    const acme: ProviderSummary = {
-      id: "acme",
-      displayName: "Acme Agent",
+  it("renders every provider with its own roles and windows, and omits optional metadata the provider did not supply", () => {
+    const acme = summary({
       capabilities: ["implement"],
       roles: ["implementer"],
       availability: { available: true, authenticated: true, version: "1.2.3" },
-      capacity: { status: "known", windows: [{ id: "a", usedFraction: 0.5 }], account: { planLabel: "Pro" } }
-    };
-    const zenith: ProviderSummary = {
+      capacity: { status: "known", windows: [observed(0.5, "acme-window")], account: { planLabel: "Pro" } }
+    });
+    const zenith = summary({
       id: "zenith",
       displayName: "Zenith Agent",
       capabilities: ["review"],
       roles: ["reviewer", "verifier"],
-      availability: { available: true },
-      capacity: { status: "known", windows: [{ id: "b", usedFraction: 0.75 }] }
-    };
+      capacity: { status: "known", windows: [observed(0.75, "zenith-window")] }
+    });
     // Each provider's block starts at a header line (no indentation); everything else is indented.
-    const blocks = formatProviderSummaries([acme, zenith]).split(/\n(?=\S)/);
+    const blocks = format([acme, zenith]).split(/\n(?=\S)/);
     expect(blocks).toHaveLength(2);
     const [acmeBlock, zenithBlock] = blocks as [string, string];
 
@@ -199,6 +184,10 @@ describe("formatProviderSummaries", () => {
     expect(acmeBlock).not.toContain("verifier");
     expect(acmeBlock).toContain("authenticated: true");
     expect(acmeBlock).toContain("plan: Pro");
+    expect(acmeBlock).toContain("acme-window");
+    expect(acmeBlock).toContain("50% used");
+    expect(acmeBlock).not.toContain("zenith-window");
+    expect(acmeBlock).not.toContain("75%");
 
     expect(zenithBlock).toMatch(/^zenith /);
     expect(zenithBlock).toContain("roles:     reviewer, verifier");
@@ -206,44 +195,161 @@ describe("formatProviderSummaries", () => {
     expect(zenithBlock).not.toContain("authenticated:");
     expect(zenithBlock).not.toContain("version:");
     expect(zenithBlock).not.toContain("plan:");
+    expect(zenithBlock).toContain("zenith-window");
+    expect(zenithBlock).toContain("75% used");
+    expect(zenithBlock).not.toContain("acme-window");
+    expect(zenithBlock).not.toContain("50%");
   });
 
-  it("keeps a report containing full utilization distinct from unknown without claiming current capacity", () => {
-    const exhausted: ProviderSummary = {
-      id: "acme",
-      displayName: "Acme Agent",
-      capabilities: ["implement"],
-      roles: [],
-      availability: { available: true },
-      capacity: { status: "known", windows: [{ id: "a", usedFraction: 1 }] }
-    };
-    const unknown: ProviderSummary = {
-      id: "zenith",
-      displayName: "Zenith Agent",
-      capabilities: ["implement"],
-      roles: [],
-      availability: { available: true },
-      capacity: { status: "unknown" }
-    };
-    const [exhaustedBlock, unknownBlock] = formatProviderSummaries([exhausted, unknown]).split(/\n(?=\S)/) as [string, string];
+  it("renders every provider, and every window of every provider, not just the first", () => {
+    const out = format([
+      summary({
+        id: "one",
+        capacity: { status: "known", windows: [observed(0.1, "one-a"), observed(0.2, "one-b"), observed(0.3, "one-c")] }
+      }),
+      summary({ id: "two", capacity: { status: "known", windows: [observed(0.4, "two-a"), observed(0.5, "two-b")] } }),
+      summary({ id: "three", capacity: { status: "unknown" } })
+    ]);
+    for (const id of ["one-a", "one-b", "one-c", "two-a", "two-b"]) expect(out).toContain(id);
+    expect(out.split("\n").filter((line) => /^\S/.test(line))).toEqual(["one  (Acme Agent)", "two  (Acme Agent)", "three  (Acme Agent)"]);
+    expect(out).toContain("30% used");
+    expect(out).toContain("50% used");
+  });
 
-    expect(exhaustedBlock).toContain("known (1 quota windows reported)");
-    expect(exhaustedBlock).not.toContain("% remaining");
-    expect(exhaustedBlock).not.toContain("unknown");
+  it("keeps a report of full utilization distinct from unknown capacity, without claiming current capacity", () => {
+    const exhausted = summary({ capacity: { status: "known", windows: [observed(1)] } });
+    const unknown = summary({ id: "zenith", displayName: "Zenith Agent", capacity: { status: "unknown" } });
+    const [exhaustedBlock, unknownBlock] = format([exhausted, unknown]).split(/\n(?=\S)/) as [string, string];
+
+    expect(exhaustedBlock).toContain("100% used, 0% remaining (as observed)");
+    expect(exhaustedBlock).not.toContain("usage:     unknown");
     expect(unknownBlock).toContain("capacity:  unknown");
-    expect(unknownBlock).not.toContain("0% remaining");
+    expect(unknownBlock).not.toMatch(/\d+%|window/);
   });
 
   it("preserves the failure detail of an unknown capacity", () => {
-    const summary: ProviderSummary = {
-      id: "acme",
-      displayName: "Acme Agent",
-      capabilities: ["implement"],
-      roles: [],
-      availability: { available: true },
-      capacity: { status: "unknown", detail: "capacity-boom" }
-    };
-    expect(formatProviderSummaries([summary])).toContain("capacity:  unknown (capacity-boom)");
+    expect(format([summary({ capacity: { status: "unknown", detail: "capacity-boom" } })])).toContain("capacity:  unknown (capacity-boom)");
+  });
+
+  it("never lets capacity change availability, or turn exhausted quota into unavailability", () => {
+    const availabilityLine = (out: string): string => out.split("\n").find((line) => line.startsWith("    available:"))!;
+    const capacities: ProviderCapacityInfo[] = [
+      { status: "unknown" },
+      { status: "known", windows: [observed(0)] },
+      { status: "known", windows: [observed(1), observed(1.5, "x")] },
+      { status: "known", windows: [] }
+    ];
+    const lines = capacities.map((capacity) =>
+      availabilityLine(
+        format([summary({ availability: { available: true, authenticated: true, version: "9" }, capacity })], { maxAgeMs: 900_000 })
+      )
+    );
+    expect(new Set(lines)).toEqual(new Set(["    available: true, authenticated: true, version: 9"]));
+    const exhausted = format([summary({ capacity: { status: "known", windows: [observed(1.5)] } })], { maxAgeMs: 900_000 });
+    expect(exhausted).not.toMatch(/blocked|unavailable|exhausted|disabled|cannot|do not use/i);
+  });
+
+  it("does not modify the summaries it formats", () => {
+    const summaries = [
+      summary({
+        id: `evil${ESC}[31m`,
+        capacity: { status: "known", windows: [{ ...observed(0.5), label: `L${ESC}[0m\nx` }], account: { planLabel: "p\nq" } },
+        availability: { available: true, detail: `d\r\n${ESC}[0m` }
+      })
+    ];
+    const before = structuredClone(summaries);
+    format(summaries, { maxAgeMs: 900_000 });
+    format(summaries);
+    expect(summaries).toEqual(before);
+  });
+
+  describe("presentation-boundary sanitization", () => {
+    const hostile = summary({
+      id: `evil${ESC}[31m-id\ninjected`,
+      displayName: `Evil\n    capacity:  known, 99 windows\n    roles:     admin`,
+      roles: [`role${ESC}]0;title${chr(7)}x`, "ok\trole"],
+      availability: { available: true, version: `1.0${ESC}[2J`, detail: `line1\r\n    available: true\n${ESC}[31mred` },
+      capacity: {
+        status: "known",
+        account: { planLabel: `pro${ESC}[0m\nplan: hacked` },
+        windows: [
+          {
+            ...observed(0.5),
+            id: `w${ESC}[31m\n    fake-window`,
+            label: `${ESC}[1mBold\nLabel${chr(0x202e)}`
+          }
+        ]
+      }
+    });
+
+    it("reaches the terminal with no control characters and no injected output lines", () => {
+      const out = format([hostile], { maxAgeMs: 900_000 });
+      for (const line of out.split("\n")) expect(hasControl(line)).toBe(false);
+      expect(out.split("\n").filter((line) => line.startsWith("    capacity:  "))).toHaveLength(1);
+      expect(out.split("\n").filter((line) => line.startsWith("    roles:     "))).toHaveLength(1);
+      expect(out.split("\n").filter((line) => line.startsWith("    available: "))).toHaveLength(1);
+      expect(out.split("\n").filter((line) => line.startsWith("    detail:    "))).toHaveLength(1);
+      expect(out.split("\n").some((line) => line.trim().startsWith("fake-window"))).toBe(false);
+      expect(out.split("\n").filter((line) => /^\S/.test(line))).toHaveLength(2); // header + legend only
+    });
+
+    it("keeps the readable text of each hostile value", () => {
+      const out = format([hostile]);
+      expect(out).toContain("evil-id injected");
+      expect(out).toContain("role");
+      expect(out).toContain("version: 1.0");
+      expect(out).toContain("plan: pro plan: hacked");
+      expect(out).toContain("Bold Label");
+    });
+
+    it("sanitizes an unknown capacity's diagnostic detail, and the availability detail", () => {
+      const out = format([
+        summary({
+          capacity: { status: "unknown", detail: `${ESC}[31mboom\nfake: line` },
+          availability: { available: false, detail: `${ESC}]0;t${chr(7)}bad\r\nnews` }
+        })
+      ]);
+      expect(out).toContain("capacity:  unknown (boom fake: line)");
+      expect(out).toContain("detail:    bad news");
+      expect(hasControl(out.replace(/\n/g, ""))).toBe(false);
+    });
+
+    it("bounds an overlong identifier, label and detail with a deterministic marker", () => {
+      const out = format([
+        summary({
+          id: "i".repeat(500),
+          availability: { available: false, detail: "d".repeat(1000) },
+          capacity: { status: "known", windows: [{ ...observed(0.5), id: "x".repeat(500), label: "l".repeat(500) }] }
+        })
+      ]);
+      const ellipsis = chr(0x2026);
+      const header = out.split("\n")[0]!;
+      expect(header).toContain(`${"i".repeat(79)}${ellipsis}`);
+      expect(header).not.toContain("i".repeat(80));
+      const detail = out.split("\n").find((line) => line.startsWith("    detail:"))!;
+      expect(detail).toContain(`${"d".repeat(239)}${ellipsis}`);
+      expect(detail).not.toContain("d".repeat(240));
+      const name = out.split("\n").find((line) => line.startsWith("      ") && !line.startsWith("        "))!;
+      expect(name).toContain(`${"l".repeat(79)}${ellipsis}  [${"x".repeat(79)}${ellipsis}]`);
+    });
+
+    it("leaves ordinary Unicode labels readable", () => {
+      const out = format([
+        summary({
+          displayName: "Ünïcode Agent 日本語",
+          capacity: { status: "known", windows: [{ ...observed(0.5), id: "ウィンドウ-1", label: "5時間 (café 🙂)" }] }
+        })
+      ]);
+      expect(out).toContain("(Ünïcode Agent 日本語)");
+      expect(out).toContain("5時間 (café 🙂)  [ウィンドウ-1]");
+    });
+
+    it("falls back to a visible placeholder when an identifier sanitizes to nothing", () => {
+      const out = format([
+        summary({ capacity: { status: "known", windows: [{ ...observed(0.5), id: `${ESC}[31m\n`, label: `${chr(0)}` }] } })
+      ]);
+      expect(out).toContain("(empty id)");
+    });
   });
 });
 

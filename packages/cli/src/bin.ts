@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { Command } from "commander";
+import { Command, InvalidArgumentError } from "commander";
 import {
   createOrchestrator,
   initProject,
@@ -9,6 +9,7 @@ import {
   BudgetExceededError,
   WorkspaceConfinementError
 } from "@ai-engine/orchestrator";
+import type { CapacityFreshnessPolicy } from "@ai-engine/core";
 import { resolveEnginePaths, loadGlobalConfig } from "@ai-engine/config";
 import { TaskLockedError } from "@ai-engine/security";
 import {
@@ -21,6 +22,7 @@ import {
   formatVerificationResults
 } from "./format.js";
 import { runGuided, createRealIO, NonInteractiveApprovalRequiredError } from "./guided.js";
+import { parseMaxAge } from "./max-age.js";
 
 const program = new Command();
 program.name("ai").description("AI Engine — provider-independent AI software-engineering orchestration control plane.").version("0.1.0");
@@ -374,15 +376,32 @@ program
     }
   });
 
+/** Commander parses `--max-age` at option-parse time, so a bad value is a usage error before any provider is probed. */
+function maxAgeOption(text: string): CapacityFreshnessPolicy {
+  try {
+    return parseMaxAge(text);
+  } catch (err) {
+    throw new InvalidArgumentError(err instanceof Error ? err.message : String(err));
+  }
+}
+
 program
   .command("providers")
   .description(
-    "List every registered provider generically (id, capabilities, currently-assigned roles, live availability, capacity) — never hardcodes which providers exist"
+    "List every registered provider generically (id, capabilities, currently-assigned roles, live availability, capacity windows) — never hardcodes which providers exist"
   )
-  .action(async () => {
+  .option(
+    "--max-age <duration>",
+    "also judge each capacity window's observation age against this explicit limit, <int><s|m|h|d> (e.g. 15m); without it no freshness verdict is shown",
+    maxAgeOption
+  )
+  .action(async (opts: { maxAge?: CapacityFreshnessPolicy }) => {
     try {
       const orchestrator = await createOrchestrator(process.cwd());
-      console.log(formatProviderSummaries(await orchestrator.listProviders()));
+      const summaries = await orchestrator.listProviders();
+      // The one clock reading for this run: every provider and window is presented at this same instant.
+      const nowMs = Date.now();
+      console.log(formatProviderSummaries(summaries, { nowMs, freshnessPolicy: opts.maxAge }));
     } catch (err) {
       fail(err);
     }
