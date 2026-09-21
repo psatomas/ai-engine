@@ -13,6 +13,7 @@ import type {
   ObservedUsage,
   ProviderAdapter,
   ProviderAvailability,
+  ProviderCapacityInfo,
   SandboxLevel
 } from "@ai-engine/core";
 import { subtractObservedUsage } from "@ai-engine/core";
@@ -20,6 +21,7 @@ import type { Logger } from "@ai-engine/logging";
 import { resolveProviderBinary } from "./resolve.js";
 import { composeUserPrompt } from "./prompt.js";
 import { AsyncQueue } from "./async-queue.js";
+import { readCodexCapacity } from "./codex-capacity.js";
 
 /**
  * FOUND BY INDEPENDENT REVIEW: provider JSON is an external, untrusted runtime boundary — the
@@ -318,6 +320,15 @@ export class CodexProvider implements ProviderAdapter {
 
   capabilities(): Capability[] {
     return CAPABILITIES;
+  }
+
+  /**
+   * Passive local acquisition only — see readCodexCapacity's own doc comment for the full
+   * rationale. Never resolves/launches the Codex binary, never touches the network, never
+   * consumes a model turn, and is entirely independent of invoke()/checkAvailability().
+   */
+  getCapacity(): Promise<ProviderCapacityInfo> {
+    return readCodexCapacity();
   }
 
   private async resolveBinary(): Promise<string> {
