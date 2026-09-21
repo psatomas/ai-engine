@@ -63,3 +63,29 @@ export function verificationPassed(report: VerificationReport, checks: Verificat
   const requiredIds = new Set(checks.filter((c) => c.requiredForReady).map((c) => c.id));
   return report.results.every((r) => !requiredIds.has(r.checkId) || r.status === "PASS");
 }
+
+/**
+ * The required checks a human still has to approve: results of the given report that are
+ * `NOT_APPROVED`, whose check is required for READY, and that are *not currently* approved.
+ *
+ * The "not currently approved" test uses the supplied `checks` (each carrying the approval
+ * store's live `approved` flag) rather than the report's historical `NOT_APPROVED` status alone,
+ * because a report never changes retroactively: without it, a check a human already approved
+ * would be flagged (and re-approved, appending a duplicate approval record) forever. A result
+ * whose check is no longer configured, or is not required, is not returned.
+ *
+ * Pure: no I/O and no clock. Shared, rather than re-derived per caller, so there is exactly one
+ * definition of "a required check is waiting on a human".
+ */
+export function unapprovedRequiredChecks(
+  report: VerificationReport | undefined,
+  checks: ReadonlyArray<VerificationCheck & { approved: boolean }>
+): Array<{ result: VerificationResult; check: VerificationCheck & { approved: boolean } }> {
+  const pending: Array<{ result: VerificationResult; check: VerificationCheck & { approved: boolean } }> = [];
+  for (const result of report?.results ?? []) {
+    if (result.status !== "NOT_APPROVED") continue;
+    const check = checks.find((c) => c.id === result.checkId);
+    if (check?.requiredForReady && !check.approved) pending.push({ result, check });
+  }
+  return pending;
+}

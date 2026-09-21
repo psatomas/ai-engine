@@ -1,5 +1,6 @@
 import { createInterface } from "node:readline/promises";
 import type { DiffSummary } from "@ai-engine/git";
+import { unapprovedRequiredChecks } from "@ai-engine/core";
 import type { ReviewFinding, ReviewReport, TaskRecord, VerificationCheck, VerificationResult, WorkflowState } from "@ai-engine/core";
 
 /**
@@ -235,15 +236,10 @@ async function findUnapprovedRequiredChecks(
   task: TaskRecord
 ): Promise<Array<{ result: VerificationResult; check: VerificationCheck & { approved: boolean } }>> {
   const latest = task.verification.at(-1);
-  const notApproved = latest?.results.filter((r) => r.status === "NOT_APPROVED") ?? [];
-  if (notApproved.length === 0) return [];
-  const checks = await orchestrator.listVerificationChecks(task.id);
-  const pairs: Array<{ result: VerificationResult; check: VerificationCheck & { approved: boolean } }> = [];
-  for (const result of notApproved) {
-    const check = checks.find((c) => c.id === result.checkId);
-    if (check?.requiredForReady && !check.approved) pairs.push({ result, check });
-  }
-  return pairs;
+  if (!latest?.results.some((r) => r.status === "NOT_APPROVED")) return [];
+  // The derivation itself lives in @ai-engine/core so "a required check is waiting on a human"
+  // has exactly one definition.
+  return unapprovedRequiredChecks(latest, await orchestrator.listVerificationChecks(task.id));
 }
 
 /**
