@@ -10,12 +10,14 @@ import type {
   ObservedUsage,
   ProviderAdapter,
   ProviderAvailability,
+  ProviderCapacityInfo,
   SandboxLevel
 } from "@ai-engine/core";
 import type { Logger } from "@ai-engine/logging";
 import { resolveProviderBinary } from "./resolve.js";
 import { composeUserPrompt } from "./prompt.js";
 import { AsyncQueue } from "./async-queue.js";
+import { readClaudeCapacity } from "./claude-capacity.js";
 
 const CAPABILITIES: Capability[] = [
   "analyze",
@@ -204,6 +206,10 @@ export class ClaudeProvider implements ProviderAdapter {
 
   capabilities(): Capability[] {
     return CAPABILITIES;
+  }
+
+  getCapacity(): Promise<ProviderCapacityInfo> {
+    return readClaudeCapacity();
   }
 
   private async resolveBinary(): Promise<string> {
