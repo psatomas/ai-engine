@@ -16,7 +16,7 @@ import type {
   ProviderCapacityInfo,
   SandboxLevel
 } from "@ai-engine/core";
-import { subtractObservedUsage } from "@ai-engine/core";
+import { subtractObservedUsage, withManagedTaskMarker } from "@ai-engine/core";
 import type { Logger } from "@ai-engine/logging";
 import { resolveProviderBinary } from "./resolve.js";
 import { composeUserPrompt } from "./prompt.js";
@@ -450,7 +450,7 @@ export class CodexProvider implements ProviderAdapter {
         reject: false,
         timeout: request.timeoutMs,
         cancelSignal: controller.signal,
-        env: { ...process.env }
+        env: withManagedTaskMarker(process.env, request.taskId)
       });
 
       const commandsRun: Array<{ command: string; exitCode: number | null }> = [];

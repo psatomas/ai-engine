@@ -13,6 +13,7 @@ import type {
   ProviderCapacityInfo,
   SandboxLevel
 } from "@ai-engine/core";
+import { withManagedTaskMarker } from "@ai-engine/core";
 import type { Logger } from "@ai-engine/logging";
 import { resolveProviderBinary } from "./resolve.js";
 import { composeUserPrompt } from "./prompt.js";
@@ -286,7 +287,7 @@ export class ClaudeProvider implements ProviderAdapter {
       reject: false,
       timeout: request.timeoutMs,
       cancelSignal: controller.signal,
-      env: { ...process.env }
+      env: withManagedTaskMarker(process.env, request.taskId)
     });
 
     let providerSessionId: string | undefined;
