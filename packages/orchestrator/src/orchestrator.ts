@@ -40,6 +40,7 @@ import { loadProjectContext } from "./project-context.js";
 import { writeTaskSummary } from "./task-summary.js";
 import { ArchitectJsonSchema, ReviewJsonSchema, tryParseArchitectOutput, tryParseReviewOutput } from "./output-schemas.js";
 import { prepareWorktreeDependencies } from "./dependency-setup.js";
+import { derivePendingDecision, requiresCheckLookup, type PendingDecision } from "./pending-decision.js";
 
 const DIFF_CONTEXT_MAX_CHARS = 40_000;
 
@@ -646,6 +647,26 @@ export class Orchestrator {
         approved: c.origin === "repository_configured" ? await this.deps.commandApprovalStore.isApproved(c.command) : true
       }))
     );
+  }
+
+  /**
+   * What human decision, if any, this task is waiting on: the kind, the answers the workflow will
+   * actually accept, and the bounded content the decision is about (see `PendingDecision`).
+   * `undefined` when nothing needs a human — the task is advanceable, terminal, or READY.
+   *
+   * Read-only and lock-free, like `getTask`: it neither invokes a provider nor changes any state,
+   * and atomic persistence makes an unlocked read safe. It is a snapshot — a caller answering it
+   * must go through the mutating methods (`decidePlan`, `decideGate`, `retry`, `resume`,
+   * `approveVerificationCommand`, `cancel`), which validate against the live state, and may use
+   * `PendingDecision.id` to detect that the decision moved on since it was read.
+   */
+  async pendingDecision(taskId: string): Promise<PendingDecision | undefined> {
+    const task = await this.deps.taskStore.requireTask(taskId);
+    const checks = requiresCheckLookup(task) ? await this.listVerificationChecks(taskId) : undefined;
+    return derivePendingDecision(task, {
+      canApply: (trigger, from) => this.deps.workflow.canApply(from ? { ...task, workflowState: from } : task, trigger),
+      checks
+    });
   }
 
   async pause(taskId: string, by: string): Promise<TaskRecord> {
