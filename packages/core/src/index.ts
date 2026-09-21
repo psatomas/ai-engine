@@ -1,6 +1,7 @@
 export * from "./trust.js";
 export * from "./roles.js";
 export * from "./provider.js";
+export * from "./managed.js";
 export * from "./capacity.js";
 export * from "./usage.js";
 export * from "./workflow-state.js";

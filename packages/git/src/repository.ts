@@ -25,6 +25,9 @@ export interface DiffSummary {
   suspiciousFiles: string[];
 }
 
+/** Every AI Engine task worktree lives on a branch named `<prefix><taskId>`. */
+export const TASK_BRANCH_PREFIX = "ai/";
+
 export class NotAGitRepositoryError extends Error {
   constructor(dir: string) {
     super(`"${dir}" is not inside a Git repository`);
@@ -92,7 +95,7 @@ export class GitRepository {
    */
   async createTaskWorktree(taskId: string, worktreesRoot: string, baseCommit: string): Promise<{ path: string; branch: string }> {
     await mkdir(worktreesRoot, { recursive: true });
-    const branch = `ai/${taskId}`;
+    const branch = `${TASK_BRANCH_PREFIX}${taskId}`;
     const path = join(worktreesRoot, taskId);
     await this.git.raw(["worktree", "add", "-b", branch, path, baseCommit]);
     return { path, branch };

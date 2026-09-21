@@ -1,4 +1,5 @@
 export * from "./ids.js";
+export * from "./managed-context.js";
 export * from "./task-store.js";
 export * from "./role-registry.js";
 export * from "./project-context.js";
