@@ -52,7 +52,7 @@ docs/             this documentation
 Dependency direction is strictly one-way: `core` depends on nothing of ours; `workflow`, `config`,
 `logging`, `security`, `git`, `verification` depend only on `core`; `providers` depends on `core` +
 `logging`; `orchestrator` depends on all of the above; `cli` and the VS Code extension depend only on
-`orchestrator` (+ `core`/`config` for types). Nothing outside `providers/` imports `codex.ts` or
+`orchestrator` plus shared `core`/`config` APIs (including the CLI's core capacity helpers). Nothing outside `providers/` imports `codex.ts` or
 `claude.ts` directly — see [adding-a-provider.md](./adding-a-provider.md).
 
 ## Why this shape
@@ -72,6 +72,15 @@ Dependency direction is strictly one-way: `core` depends on nothing of ours; `wo
   provider has nothing reliable to report — see [providers.md](./providers.md#usage--capacity)). This
   is what lets the CLI's `ai providers` present whatever providers are registered without
   special-casing Claude/Codex. It is a read-only report: nothing selects a provider from it.
+- **Capacity acquisition, facts, and policy are separate.** Provider adapters acquire passive local
+  evidence as independent `CapacityWindow` entries. Core's `describeCapacityWindow(window, nowMs)`
+  derives policy-independent observation facts; `evaluateCapacityWindow(window, nowMs, { maxAgeMs })`
+  adds explicit caller policy, with no implicit clock or default TTL. The CLI shares one clock value
+  across formatting and only evaluates freshness/usability when `--max-age` is supplied. Presentation
+  sanitizes and bounds provider-derived strings. Unknown capacity and missing observation timestamps
+  stay explicit; no provider-specific window logic enters the core or CLI. These reports do not drive
+  selection, scheduling, fallback, execution blocking, or replenishment. See
+  [provider capacity](./providers.md#provider-capacity) for provenance and evaluator semantics.
 - **Usage is observed, normalized, and recorded per invocation.** Each adapter reports what an
   invocation actually consumed as a provider-independent `ObservedUsage` (a dimension it doesn't report
   stays `undefined`, never `0`), and the orchestrator appends one `UsageEvent` (provider, role,

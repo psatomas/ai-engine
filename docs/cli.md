@@ -98,14 +98,52 @@ ai config show
     Print the effective global configuration (defaults merged with your config.yaml) as JSON.
 
 ai providers
-    List every registered provider generically — id, display name, which configured roles currently
-    resolve to it, availability (installed / authenticated / version, plus the detail of any failure),
-    capabilities, and capacity. Capacity is "unknown" for every provider today: neither shipped provider
-    reports it (see docs/providers.md#usage--capacity). Read-only: it runs each provider's availability
-    diagnostics (version and auth-status probes) and nothing else — it never invokes an agent, creates a
-    task, or opens a session. Never hardcodes which providers exist; reflects whatever's registered in
-    RoleRegistry's factory map (see docs/adding-a-provider.md).
+ai providers --max-age <duration>
+    List every registered provider generically — id, display name, effective configured roles,
+    availability, capabilities, and independent capacity windows (or explicit unknown capacity).
+    Read-only: run availability diagnostics and the shipped providers' passive local capacity
+    readers; never invoke an agent, create a task, or open a session. Registration is determined
+    by RoleRegistry's factory map. See the capacity display details below.
 ```
+
+## Provider capacity display
+
+`ai providers` shows each window's reported identity, optional label and duration, utilization and
+historical remaining capacity, observation time/age, and reset timing. Raw utilization above `1`
+remains visible as more than 100% used, with zero remaining. Missing observation times are shown as
+not reported, and unknown provider capacity stays unknown. A passed reset is a timing fact, not a
+claim that quota has replenished. Without `--max-age`, no freshness or usability evaluation runs,
+and no fresh/stale/usable verdict is printed.
+
+`ai providers --max-age <duration>` additionally applies the existing core evaluator with that
+explicit caller-supplied age limit to each reported window. It shows freshness and `usable evidence`:
+valid utilization and fresh evidence with no passed or invalid reset. The legend is printed once,
+only if at least one window was actually evaluated; an unknown-only provider set has no legend.
+Usable evidence is an evidence-quality verdict, not execution permission or a routing verdict.
+
+Duration syntax is canonical:
+
+```text
+^([1-9][0-9]*)([smhd])$
+```
+
+`15m`, `2h`, and `7d` are valid; units are seconds, minutes, hours, and days. `05m`, zero, uppercase
+units, compound durations, decimals, signs, whitespace-padded forms, and values whose millisecond
+conversion exceeds the safe-integer range are rejected before providers are probed. There is no
+default max age. For a valid non-future observation, age strictly below the limit is fresh; equality
+or greater is stale. A future or malformed observation is invalid; a missing observation time leaves
+freshness unknown. Window duration and reset time do not determine freshness.
+
+Claude's passive reader uses its cached `fetchedAtMs` as observation provenance. Codex's passive
+rollout reader deliberately supplies no `observedAt`, so its freshness remains unknown and its
+usable evidence remains `no` even with `--max-age`. Neither reader verifies current-account binding.
+See [provider capacity](./providers.md#provider-capacity) for acquisition details and limitations.
+
+One explicit `nowMs` is shared across the entire formatting operation, keeping relative ages
+consistent within the invocation. Provider-derived display strings are sanitized to remove terminal
+escapes and control characters and bounded before rendering (80 Unicode code points for labels,
+240 for diagnostic details). This protects presentation; it does not validate account ownership or
+turn historical capacity into current execution permission.
 
 ## Guided mode (`ai start`)
 

@@ -238,17 +238,113 @@ invocation _reported consuming_ (observed usage), and how much of an account's a
 
 ### Provider capacity
 
-- `ProviderAdapter.getCapacity?(): Promise<ProviderCapacityInfo>` (`packages/core/src/provider.ts`) is an
-  **optional** method. `ProviderCapacityInfo` is
-  `{ status: "known" | "unknown", account?, remainingFraction?, resetsAt?, detail? }`. `"unknown"`
-  (`UNKNOWN_PROVIDER_CAPACITY`) is a first-class, expected value, not an error state, and an adapter
-  without `getCapacity()` is treated exactly as if it returned it. Capacity is never inferred from token
-  counts or invocation behavior, and `account.planLabel` is only ever set from something the provider
-  itself states — a subscription tier is account/capacity metadata, never a separate provider id.
-- **Neither `ClaudeProvider` nor `CodexProvider` implements `getCapacity()`.** Nothing in AI Engine
-  currently reads capacity for either shipped provider (the `auth status` / `login status` probes described
-  above are used only for availability), so `listProviders()` and `ai providers` report
-  `{ status: "unknown" }` for both — honestly, rather than fabricating a number.
+`ProviderAdapter.getCapacity?(): Promise<ProviderCapacityInfo>` (`packages/core/src/provider.ts`)
+is optional. A known report has `{ status: "known", windows: CapacityWindow[], account?, detail? }`;
+an unknown report has `{ status: "unknown", account?, detail? }` and no windows.
+`UNKNOWN_PROVIDER_CAPACITY` is a first-class, expected result, including for adapters without
+`getCapacity()`. The generic contract permits a known report with zero windows; the shipped readers
+require at least one surviving reliable window to return known capacity.
+
+Each quota window is independent:
+
+```ts
+interface CapacityWindow {
+  id: string;
+  label?: string;
+  durationSeconds?: number;
+  usedFraction?: number;
+  observedAt?: string;
+  resetsAt?: string;
+}
+```
+
+`id` is opaque and unique within the report; consumers do not infer duration or policy from it.
+`usedFraction` is utilization as observed: absent means unknown, `0` means unused, `1` means fully
+used, and finite non-negative values above `1` preserve overage. `remainingCapacityFraction` derives
+`max(0, 1 - usedFraction)` for valid utilization and returns `undefined` for missing or invalid values.
+There is no provider-wide utilization, remaining fraction, or reset timestamp, and windows are not
+aggregated. `observedAt` and `resetsAt` are optional ISO timestamps with different meanings: when the
+evidence was observed and when a reset was reported. A passed reset never rewrites utilization or
+implies replenishment. Capacity is never inferred from invocation token counts. `account.planLabel`
+may only reflect a provider-stated label; a subscription tier is metadata, not a provider id.
+
+#### Observation facts and explicit freshness
+
+`describeCapacityWindow(window, nowMs)` (`packages/core/src/capacity.ts`) interprets reported facts
+at an explicit Unix-millisecond clock, without reading a clock itself:
+
+- `utilization`: `valid`, `unknown`, or `invalid`, with a derived `remainingFraction` when valid.
+- `observation`: `reported`, `absent`, or `invalid`, with signed `observationAgeMs = nowMs - observedAtMs`
+  for a valid timestamp. A future observation stays `reported` with a negative age at this layer.
+- `reset`: `future`, `passed`, `unknown`, or `invalid`, with signed `msUntilReset = resetsAtMs - nowMs`
+  for a valid timestamp. Equality is `passed`, with zero time until reset.
+
+This helper decides neither freshness nor usability, availability, routing, scheduling,
+replenishment, or execution permission.
+
+`evaluateCapacityWindow(window, nowMs, { maxAgeMs })` adds a caller-supplied freshness policy.
+There is no implicit clock, default TTL, or provider-specific freshness limit. `maxAgeMs` must be
+finite and positive. For a valid, non-future observation:
+
+```text
+age < maxAgeMs  => fresh
+age >= maxAgeMs => stale
+```
+
+Missing observation time yields `freshness: "unknown"`; malformed or future observation time yields
+`"invalid"`. Neither `durationSeconds` nor `resetsAt` determines freshness. `usable` requires valid
+utilization, fresh evidence, and no passed or invalid reset. An unknown reset does not itself prevent
+usability, and zero remaining capacity can still be usable evidence. This is an evidence-quality
+verdict, not permission to execute or a routing verdict. Historical utilization and remaining
+fraction are still reported even when evidence is unusable.
+
+#### Passive Claude acquisition
+
+`ClaudeProvider.getCapacity()` delegates to `readClaudeCapacity` in
+`packages/providers/src/claude-capacity.ts`. It reads the bounded local `~/.claude.json` source,
+projecting `cachedUsageUtilization.fetchedAtMs` and `cachedUsageUtilization.utilization`.
+Claude's own `fetchedAtMs` supplies observation provenance, converted to `observedAt`; filesystem
+mtime and AI Engine's read time do not. A missing or malformed cache timestamp makes capacity unknown.
+
+Supported entries under `utilization` are `five_hour`, `seven_day`, `seven_day_opus`,
+`seven_day_sonnet`, and `seven_day_oauth_apps`. Each entry's `utilization` percentage becomes
+`usedFraction`; its optional `resets_at` becomes `resetsAt`. Missing, null, or malformed individual
+windows are omitted independently, preserving valid siblings. Known capacity requires at least one
+surviving reliable window. The reader supplies no plan label and establishes no current-account
+binding: cached evidence may belong to a previously authenticated account.
+
+Acquisition does not invoke Claude, make a network request, refresh the cache, or evaluate freshness.
+It reports historical evidence for the caller to interpret.
+
+#### Passive Codex acquisition
+
+`CodexProvider.getCapacity()` delegates to `readCodexCapacity` in
+`packages/providers/src/codex-capacity.ts`. It scans bounded local rollout JSONL evidence under
+`~/.codex/sessions`: traversal, candidate files, file reads, tail bytes, and processed records all
+have finite limits. It extracts only capacity fields from `event_msg` / `token_count` records'
+`rate_limits`. Capacity output does not include transcript messages, prompts, or session contents.
+No Codex process, network request, model call, or app-server connection is used for acquisition.
+
+Each `limit_id` bucket is resolved independently. Candidate file names are traversed in descending
+order; within a file's processed tail the last valid bucket snapshot wins, and a bucket resolved
+from an earlier-processed file is not overridden by a later file. Its `primary` and `secondary`
+windows always come from the same selected record, with IDs `<limit_id>:primary` and
+`<limit_id>:secondary`. Missing or malformed siblings are not backfilled from other records.
+There is no cross-record backfill or cross-bucket merging; different buckets can come from different
+records. `used_percent` becomes `usedFraction`, `window_minutes` supplies optional duration, and
+`resets_at` in Unix seconds becomes an optional ISO reset timestamp. A validated provider-stated
+`plan_type` is surfaced as `account.planLabel` only when the collected valid plan labels do not
+conflict; no tier is inferred. With no reliable windows, capacity is unknown.
+
+**Codex capacity windows deliberately have no `observedAt`.** Investigation did not establish that
+the rollout event timestamp, reset timestamp, or another locally available field provides defensible
+observation-time provenance. File ordering, mtime, and read time are not substitutes. These windows
+can expose utilization and reset facts, but the evaluator reports `freshness: "unknown"` and
+`usable: false`; supplying `--max-age` cannot make them usable evidence. Passive rollout evidence is
+not verified as belonging to the currently authenticated account.
+
+#### Enumeration and presentation
+
 - **Enumeration.** `RoleRegistry.describeProviders()` and `Orchestrator.listProviders()` iterate the factory
   map `adapterForRole()` uses, never a hardcoded id list, and return one
   `ProviderSummary { id, displayName, capabilities, roles, availability, capacity }` per registered
@@ -259,8 +355,13 @@ invocation _reported consuming_ (observed usage), and how much of an account's a
   `getCapacity()` rejects, its capacity is listed as unknown — each with the error message as `detail` —
   and the other providers are still listed. Only asynchronous (rejected-promise) failures are contained: a
   synchronous throw from either method, or a provider factory that throws, rejects the whole call.
-- This is a read-only reporting contract, not routing: nothing selects a provider based on capacity or
-  usage.
+- `ai providers` shows policy-independent window facts; `ai providers --max-age <duration>` also
+  evaluates freshness and usable evidence. See [cli.md](./cli.md#provider-capacity-display) for syntax
+  and limitations. Provider-derived display strings are sanitized and bounded before terminal
+  rendering; this is a presentation safeguard, not a broader security guarantee.
+- This is passive reporting only. It adds no capacity-based selection, adaptive routing, load
+  balancing, quota-based fallback, rate-limit-aware scheduling, execution blocking, automatic
+  replenishment, background monitoring, or VS Code capacity UI.
 
 ## Sandbox level → provider flag mapping
 

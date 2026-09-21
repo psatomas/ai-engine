@@ -38,15 +38,25 @@ and `undefined` when there is no reliable baseline — and the raw total as `cum
 orchestrator persists that baseline with the session and re-supplies it only to the same provider's same
 session, so the adapter never has to.
 
-**Capacity (optional).** `getCapacity()` is how a provider reports account-level capacity/quota (e.g.
-"62% of this billing period's usage remaining"), separately from per-invocation usage. It's optional, and
-you should only implement it if the product has a real, credential-free surface that reliably reports
-quota — **never derive or guess it from observed token counts, and never invent a subscription tier**.
-Neither `ClaudeProvider` nor `CodexProvider` implements it today; `Orchestrator.listProviders()` reports
-`{ status: "unknown" }` for both of them, honestly, rather than fabricating a number. If your provider's
-status surface does report a plan/tier label directly (e.g. an auth-status JSON field named something like
-`"plan"`), that's the _only_ legitimate source for `ProviderCapacityInfo.account.planLabel` — a
-subscription tier is account/capacity metadata, never a separate provider id.
+**Capacity (optional).** Implement `getCapacity()` only when there is reliable provider-reported
+quota evidence, separately from per-invocation usage. Return `{ status: "known", windows }` with
+independent `CapacityWindow` entries, or `{ status: "unknown" }` when evidence is unavailable.
+Each window has an opaque `id` and optional `label`, `durationSeconds`, `usedFraction`, `observedAt`,
+and `resetsAt`; see [the capacity contract](./providers.md#provider-capacity) for the exact shape.
+Never aggregate windows into a provider-wide fraction or reset time, derive quota from token counts,
+or invent a subscription tier. Validate external values and preserve utilization above `1`.
+Only a directly provider-stated plan label belongs in `account.planLabel`.
+
+Supply `observedAt` only with defensible observation-time provenance, never from file mtime or the
+time the engine read the source. Keep missing timestamps and unknown utilization explicit. Do not
+assign a freshness TTL in acquisition: `describeCapacityWindow(window, nowMs)` interprets facts,
+while `evaluateCapacityWindow(window, nowMs, { maxAgeMs })` requires the caller's explicit policy.
+Neither changes provider availability or execution permission.
+
+Both shipped adapters implement passive local readers: Claude uses its own cached `fetchedAtMs`,
+while Codex deliberately leaves `observedAt` absent. Neither reader establishes current-account
+binding. See [Claude acquisition](./providers.md#passive-claude-acquisition) and
+[Codex acquisition](./providers.md#passive-codex-acquisition) for sources and limitations.
 
 Use `packages/providers/src/codex.ts` or `claude.ts` as a template — both follow the same shape:
 resolve a binary (`resolve.ts`'s `resolveProviderBinary` is reusable for any CLI-shaped product),
