@@ -1,0 +1,28 @@
+{
+  "name": "@ai-engine/mcp",
+  "version": "0.1.0",
+  "description": "Read-only stdio MCP boundary for AI Engine: lets an initiating agent inspect existing tasks.",
+  "type": "module",
+  "bin": {
+    "ai-engine-mcp": "./dist/bin.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -b tsconfig.json && chmod +x dist/bin.js",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@ai-engine/orchestrator": "^0.1.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "@ai-engine/core": "^0.1.0",
+    "@ai-engine/workflow": "^0.1.0"
+  }
+}
