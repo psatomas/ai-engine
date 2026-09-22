@@ -8,4 +8,5 @@ export * from "./prompts.js";
 export * from "./task-summary.js";
 export * from "./output-schemas.js";
 export * from "./pending-decision.js";
+export * from "./task-view.js";
 export * from "./orchestrator.js";
