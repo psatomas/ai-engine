@@ -10,3 +10,4 @@ export * from "./output-schemas.js";
 export * from "./pending-decision.js";
 export * from "./task-view.js";
 export * from "./orchestrator.js";
+export * from "./delegated-run.js";

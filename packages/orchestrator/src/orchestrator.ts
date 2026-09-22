@@ -34,7 +34,7 @@ import { detectChecks, runVerification } from "@ai-engine/verification";
 import { createLogger, FileSink, ConsoleSink, type Logger, type LogSink, type LogLevel } from "@ai-engine/logging";
 import { TaskStore } from "./task-store.js";
 import { RoleRegistry } from "./role-registry.js";
-import { generateTaskId } from "./ids.js";
+import { generateTaskId, isSafeTaskId } from "./ids.js";
 import { systemPromptForRole } from "./prompts.js";
 import { loadProjectContext } from "./project-context.js";
 import { writeTaskSummary } from "./task-summary.js";
@@ -169,6 +169,23 @@ export async function createOrchestrator(
  * touching the same task concurrently (the lock), and every state change is
  * auditable from the task's `history`.
  */
+export interface CreateTaskOptions {
+  taskId?: string;
+  requireCleanTree?: boolean;
+}
+
+export class DirtyWorkingTreeError extends Error {
+  constructor(public readonly counts: { staged: number; tracked: number; untracked: number }) {
+    super("DIRTY_WORKING_TREE");
+    this.name = "DirtyWorkingTreeError";
+  }
+}
+
+export async function requireCleanTaskTree(repo: GitRepository): Promise<void> {
+  const counts = await repo.delegationDirtyCounts();
+  if (counts.staged || counts.tracked || counts.untracked) throw new DirtyWorkingTreeError(counts);
+}
+
 export class Orchestrator {
   constructor(private readonly deps: OrchestratorDeps) {}
 
@@ -205,7 +222,10 @@ export class Orchestrator {
 
   // ---- task lifecycle -------------------------------------------------------
 
-  async createTask(originalRequest: string): Promise<TaskRecord> {
+  async createTask(originalRequest: string, options: CreateTaskOptions = {}): Promise<TaskRecord> {
+    const id = options.taskId === undefined ? generateTaskId() : options.taskId;
+    if (!isSafeTaskId(id)) throw new Error("INVALID_TASK_ID");
+    if (options.requireCleanTree) await requireCleanTaskTree(this.deps.gitRepo);
     const status = await this.deps.gitRepo.status();
     if (status.dirty) {
       this.deps.logger.warn(
@@ -217,9 +237,13 @@ export class Orchestrator {
     if (!baseline.commit) {
       throw new EmptyRepositoryError(this.repoRoot);
     }
-    const id = generateTaskId();
 
     return this.withTaskLock(id, async () => {
+      if (await this.deps.taskStore.get(id)) throw new Error("TASK_ALREADY_EXISTS");
+      if (options.requireCleanTree) {
+        await requireCleanTaskTree(this.deps.gitRepo);
+        Object.assign(baseline, await this.deps.gitRepo.captureBaseline());
+      }
       const { path, branch } = await this.deps.gitRepo.createTaskWorktree(id, this.deps.paths.worktreesDir, baseline.commit);
       baseline.worktreePath = path;
       baseline.taskBranch = branch;

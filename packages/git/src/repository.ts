@@ -75,6 +75,28 @@ export class GitRepository {
     };
   }
 
+  /** Read every non-ignored path, including individual untracked files. No user work is changed. */
+  async delegationDirtyCounts(): Promise<{ staged: number; tracked: number; untracked: number }> {
+    const raw = await this.git.raw(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]);
+    const entries = raw.split("\0");
+    const counts = { staged: 0, tracked: 0, untracked: 0 };
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i]!;
+      if (!entry) continue;
+      const code = entry.slice(0, 2);
+      const path = entry.slice(3);
+      if (code === "??") {
+        // Only untracked mirrors are exempt. Tracked edits, even under .ai/tasks, still refuse.
+        if (!path.startsWith(".ai/tasks/")) counts.untracked++;
+      } else {
+        if (code[0] !== " ") counts.staged++;
+        if (code[1] !== " ") counts.tracked++;
+        if (code.includes("R") || code.includes("C")) i++; // porcelain -z rename source
+      }
+    }
+    return counts;
+  }
+
   /** Snapshot taken before any agent touches the repository. Persisted on the TaskRecord. */
   async captureBaseline(): Promise<GitBaseline> {
     const status = await this.status();
