@@ -175,7 +175,7 @@ describe("stdio MCP server, real orchestrator, no model", () => {
     const client = await connectStdio(child);
 
     const tools = ((await client.request("tools/list")).result!.tools as Array<{ name: string }>).map((tool) => tool.name).sort();
-    expect(tools).toEqual(["get_task", "list_tasks"]);
+    expect(tools).toEqual(["get_task", "list_tasks", "submit_task"]);
 
     const list = (await client.callTool("list_tasks")).result!;
     expect(list.isError).toBeUndefined();
@@ -236,6 +236,7 @@ describe("stdio MCP server, real orchestrator, no model", () => {
     const client = await connectStdio(child);
     for (const [name, args] of [
       ["list_tasks", {}],
+      ["submit_task", { request: "do work" }],
       ["get_task", { taskId: "t-20260102000000-bbbb" }]
     ] as const) {
       const response = await client.callTool(name, args);
@@ -255,6 +256,7 @@ describe("stdio MCP server, real orchestrator, no model", () => {
       const client = await connectStdio(child);
       for (const [name, args] of [
         ["list_tasks", {}],
+        ["submit_task", { request: "do work" }],
         ["get_task", { taskId: "t-20260102000000-bbbb" }]
       ] as const) {
         expect(errorCode(await client.callTool(name, args))).toBe("NESTED_DELEGATION_REFUSED");
@@ -270,6 +272,7 @@ describe("stdio MCP server, real orchestrator, no model", () => {
     const client = await connectStdio(child);
     for (const [name, args] of [
       ["list_tasks", {}],
+      ["submit_task", { request: "do work" }],
       ["get_task", { taskId: "t-20260102000000-bbbb" }]
     ] as const) {
       const response = await client.callTool(name, args);
@@ -284,6 +287,7 @@ describe("stdio MCP server, real orchestrator, no model", () => {
     const client = await connectStdio(child);
     for (const [name, args] of [
       ["list_tasks", {}],
+      ["submit_task", { request: "do work" }],
       ["get_task", { taskId: "t-20260102000000-bbbb" }]
     ] as const) {
       const response = await client.callTool(name, args);

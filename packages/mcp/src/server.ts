@@ -12,15 +12,15 @@ function register(server: McpServer, deps: ReturnType<typeof resolveDeps>, tool:
       title: tool.title,
       description: tool.description,
       inputSchema: tool.inputSchema,
-      // Both tools only read persisted task state: nothing is written, deleted, or reached over a network.
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      // Inspection remains read-only; submission can eventually invoke a provider in a detached worker.
+      annotations: { readOnlyHint: !tool.mutates, destructiveHint: false, idempotentHint: !tool.mutates, openWorldHint: !!tool.mutates }
     },
     async (args: unknown) => runGuarded(deps, tool, args as z.infer<z.ZodObject>)
   );
 }
 
 /**
- * The read-only AI Engine MCP server: `list_tasks` and `get_task`, and nothing else. Every tool is
+ * The AI Engine MCP server: inspection plus detached submission. Every tool is
  * registered here through the same `runGuarded` path, so the nested-delegation guard cannot be
  * skipped by adding a tool. Transport is the caller's choice; `bin.ts` serves it over stdio.
  */

@@ -89,14 +89,19 @@ const tasks = () => [
 ];
 
 describe("protocol surface", () => {
-  it("exposes exactly list_tasks and get_task, both marked read-only", async () => {
+  it("exposes inspection plus submission with accurate annotations", async () => {
     const client = await connect({ detectContext: contexts.unmanaged, openTasks: async () => fakeApi([]).api });
     const listed = (await client.request("tools/list")).result!.tools as Array<Record<string, any>>;
-    expect(listed.map((tool) => tool.name).sort()).toEqual(["get_task", "list_tasks"]);
-    expect(TOOLS.map((tool) => tool.name).sort()).toEqual(["get_task", "list_tasks"]);
-    for (const tool of listed) {
+    expect(listed.map((tool) => tool.name).sort()).toEqual(["get_task", "list_tasks", "submit_task"]);
+    expect(TOOLS.map((tool) => tool.name).sort()).toEqual(["get_task", "list_tasks", "submit_task"]);
+    for (const tool of listed.filter((tool) => tool.name !== "submit_task")) {
       expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
     }
+    expect(listed.find((tool) => tool.name === "submit_task")!.annotations).toMatchObject({
+      readOnlyHint: false,
+      idempotentHint: false,
+      openWorldHint: true
+    });
     const getTask = listed.find((tool) => tool.name === "get_task")!;
     expect(getTask.inputSchema).toMatchObject({ type: "object", properties: { taskId: { type: "string" } }, required: ["taskId"] });
     const listTasks = listed.find((tool) => tool.name === "list_tasks")!;
@@ -107,7 +112,7 @@ describe("protocol surface", () => {
     const fake = fakeApi(tasks());
     const open = vi.fn(async () => fake.api);
     const client = await connect({ detectContext: contexts.unmanaged, openTasks: open });
-    for (const name of ["submit_task", "advance_task", "decide_task", "run", "create_task"]) {
+    for (const name of ["advance_task", "decide_task", "run", "create_task"]) {
       const response = await client.callTool(name, { taskId: "t-1" });
       expect(response.error ?? response.result?.isError).toBeTruthy();
     }
@@ -207,12 +212,13 @@ describe("unmanaged context", () => {
     await client.callTool("list_tasks");
     await client.callTool("get_task", { taskId: "t-20260101000000-aaaa" });
     await client.callTool("get_task", { taskId: "t-no-such" });
-    expect([...fake.accessed].sort()).toEqual(["getTask", "listTasks", "pendingDecision", "repoRoot"]);
+    expect([...fake.accessed].sort()).toEqual(["activity", "currentActivity", "getTask", "listTasks", "pendingDecision", "repoRoot"]);
   });
 });
 
 describe("nested-delegation guard", () => {
-  const call = (name: string) => (name === "get_task" ? { taskId: "t-20260101000000-aaaa" } : {});
+  const call = (name: string) =>
+    name === "get_task" ? { taskId: "t-20260101000000-aaaa" } : name === "submit_task" ? { request: "do work" } : {};
 
   describe.each(["marker", "path", "topology", "indeterminate"] as const)("%s context", (kind) => {
     it.each(TOOLS.map((tool) => tool.name))("refuses %s before any task state is opened or read", async (name) => {
@@ -256,7 +262,11 @@ describe("nested-delegation guard", () => {
 
   it("runs the guard on every call, for every exposed tool, using the shared detector", async () => {
     const detect = vi.fn(contexts.unmanaged);
-    const client = await connect({ detectContext: detect, openTasks: async () => fakeApi(tasks()).api });
+    const client = await connect({
+      detectContext: detect,
+      openTasks: async () => fakeApi(tasks()).api,
+      submit: async () => ({ taskId: "t-1", phase: "CREATING", worker: "starting" })
+    });
     for (const tool of TOOLS) await client.callTool(tool.name, call(tool.name));
     expect(detect).toHaveBeenCalledTimes(TOOLS.length);
     await client.callTool("list_tasks");
@@ -268,7 +278,7 @@ describe("nested-delegation guard", () => {
     const listed = (await client.request("tools/list")).result!.tools as Array<{ name: string }>;
     expect(listed.length).toBe(TOOLS.length);
     for (const { name } of listed) {
-      const response = await client.callTool(name, { taskId: "t-20260101000000-aaaa" });
+      const response = await client.callTool(name, call(name));
       expect(payload(response).error.code).toBe("NESTED_DELEGATION_REFUSED");
     }
   });
@@ -442,7 +452,8 @@ describe("bounded output", () => {
     expect(MAX_LIST_TASKS_RESPONSE_BYTES).toBe(64 * 1024);
     expect(Object.fromEntries(TOOLS.map((tool) => [tool.name, tool.maxResponseBytes]))).toEqual({
       list_tasks: 64 * 1024,
-      get_task: 128 * 1024
+      get_task: 128 * 1024,
+      submit_task: 4096
     });
   });
 

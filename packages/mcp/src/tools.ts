@@ -1,9 +1,14 @@
+import { launchDetachedWorker } from "./worker-launch.js";
 import { z } from "zod";
 import type { CallToolResult } from "@modelcontextprotocol/server";
 import type { ManagedContext } from "@ai-engine/orchestrator";
 import {
   TASK_VIEW_LIMITS,
-  createOrchestrator,
+  openDelegatedTaskInspection,
+  submitDelegatedTask,
+  SubmissionError,
+  validSubmissionRequest,
+  type SubmissionActivity,
   describeTask,
   detectManagedContext,
   summarizeTasks,
@@ -19,10 +24,14 @@ import { isSafeTaskId } from "./task-id.js";
  * read-only accessors, and `defaultOpenTasks` narrows it again at runtime, so a tool cannot call a
  * mutating method (`run`, `createTask`, `decidePlan`, ...) even by mistake.
  */
-export type ReadOnlyTaskApi = Pick<Orchestrator, "repoRoot" | "listTasks" | "getTask" | "pendingDecision">;
+export type ReadOnlyTaskApi = Pick<Orchestrator, "repoRoot" | "listTasks" | "getTask" | "pendingDecision"> & {
+  currentActivity?: () => Promise<SubmissionActivity | undefined>;
+  activity?: (taskId: string) => Promise<SubmissionActivity | undefined>;
+};
 
 export interface TaskMcpDeps {
   /** The managed-context detector. Defaults to the shared `detectManagedContext` on this process's own cwd and environment. */
+  submit?: (request: string) => Promise<SubmissionActivity>;
   detectContext?: () => Promise<ManagedContext>;
   /** Opens the task state of the repository this process runs in. Called only AFTER the guard has allowed a call. */
   openTasks?: () => Promise<ReadOnlyTaskApi>;
@@ -31,19 +40,14 @@ export interface TaskMcpDeps {
 }
 
 export interface ResolvedDeps {
+  submit: (request: string) => Promise<SubmissionActivity>;
   detectContext: () => Promise<ManagedContext>;
   openTasks: () => Promise<ReadOnlyTaskApi>;
   reportError: (kind: string) => void;
 }
 
 export async function defaultOpenTasks(): Promise<ReadOnlyTaskApi> {
-  const orchestrator = await createOrchestrator(process.cwd());
-  return {
-    repoRoot: orchestrator.repoRoot,
-    listTasks: () => orchestrator.listTasks(),
-    getTask: (taskId) => orchestrator.getTask(taskId),
-    pendingDecision: (taskId) => orchestrator.pendingDecision(taskId)
-  };
+  return openDelegatedTaskInspection(process.cwd());
 }
 
 function defaultReportError(kind: string): void {
@@ -52,6 +56,7 @@ function defaultReportError(kind: string): void {
 
 export function resolveDeps(deps: TaskMcpDeps = {}): ResolvedDeps {
   return {
+    submit: deps.submit ?? ((request) => submitDelegatedTask(request, { launch: launchDetachedWorker })),
     detectContext: deps.detectContext ?? (() => detectManagedContext()),
     openTasks: deps.openTasks ?? defaultOpenTasks,
     reportError: deps.reportError ?? defaultReportError
@@ -59,6 +64,7 @@ export function resolveDeps(deps: TaskMcpDeps = {}): ResolvedDeps {
 }
 
 interface ToolContext {
+  submit: (request: string) => Promise<SubmissionActivity>;
   /** Opens the task state; the first call is the first thing that touches AI Engine state. */
   api: () => Promise<ReadOnlyTaskApi>;
   /** Runs a read of persisted state, mapping any failure to a stable error that carries none of its detail. */
@@ -67,6 +73,7 @@ interface ToolContext {
 
 export interface ToolDefinition<S extends z.ZodObject = z.ZodObject> {
   name: string;
+  mutates?: boolean;
   /**
    * The most UTF-8 bytes this tool's serialized result may occupy. The task-view budgets (which leave
    * headroom for the envelope) keep every result within it; this is the transport's own check that they did.
@@ -106,7 +113,8 @@ export const listTasksTool: ToolDefinition<z.ZodObject<Record<string, never>>> =
     const tasks = await read(() => opened.listTasks());
     const outcomes = new Map<string, PendingDecisionOutcome>();
     for (const task of tasks.slice(0, TASK_VIEW_LIMITS.tasksPerList)) outcomes.set(task.id, await pendingOutcome(opened, task.id));
-    return { ...summarizeTasks(tasks, outcomes) };
+    const submission = opened.currentActivity ? await read(() => opened.currentActivity!()) : undefined;
+    return { ...summarizeTasks(tasks, outcomes), ...(submission ? { submission } : {}) };
   }
 };
 
@@ -123,13 +131,29 @@ export const getTaskTool: ToolDefinition<z.ZodObject<{ taskId: z.ZodString }>> =
     const opened = await api();
     const task = await read(() => opened.getTask(taskId));
     // A task of another repository is not this caller's to see, and its existence is not revealed.
-    if (!task || task.id !== taskId || task.repository?.root !== opened.repoRoot) throw new ToolError("TASK_NOT_FOUND");
-    return { task: describeTask(task, await pendingOutcome(opened, taskId)) };
+    if (task && (task.id !== taskId || task.repository?.root !== opened.repoRoot)) throw new ToolError("TASK_NOT_FOUND");
+    const activity = opened.activity ? await read(() => opened.activity!(taskId)) : undefined;
+    if (!task && !activity) throw new ToolError("TASK_NOT_FOUND");
+    return { ...(task ? { task: describeTask(task, await pendingOutcome(opened, taskId)) } : {}), ...(activity ? { activity } : {}) };
+  }
+};
+
+export const submitTaskTool: ToolDefinition<z.ZodObject<{ request: z.ZodString }>> = {
+  name: "submit_task",
+  mutates: true,
+  maxResponseBytes: 4096,
+  title: "Submit an AI Engine task",
+  description:
+    "Create a delegated task in a detached worker. Returns an id immediately after launch; inspect it with get_task. Requires a clean repository. No automatic stale-worker recovery.",
+  inputSchema: z.object({ request: z.string().describe("Nonblank task request, at most 16 KiB UTF-8.") }),
+  run: async ({ request }, { submit }) => {
+    if (!validSubmissionRequest(request)) throw new ToolError("INVALID_REQUEST");
+    return { activity: await submit(request) };
   }
 };
 
 /** Every tool the server exposes. Each one runs through `runGuarded`, and only through it. */
-export const TOOLS = [listTasksTool, getTaskTool] as const;
+export const TOOLS = [listTasksTool, getTaskTool, submitTaskTool] as const;
 
 function errorKind(err: unknown): string {
   const name = err instanceof Error ? err.name : "";
@@ -153,6 +177,7 @@ export async function runGuarded<S extends z.ZodObject>(
 
   let opened: Promise<ReadOnlyTaskApi> | undefined;
   const context: ToolContext = {
+    submit: deps.submit,
     api: () =>
       (opened ??= deps.openTasks().catch((err: unknown) => {
         deps.reportError(errorKind(err));
@@ -176,6 +201,7 @@ export async function runGuarded<S extends z.ZodObject>(
     if (Buffer.byteLength(JSON.stringify(result), "utf8") > tool.maxResponseBytes) return errorResult("RESPONSE_TOO_LARGE");
     return result;
   } catch (err) {
+    if (err instanceof SubmissionError) return errorResult(err.code, err.counts ? { counts: err.counts } : {});
     if (err instanceof ToolError) return errorResult(err.code);
     deps.reportError(errorKind(err));
     return errorResult("INTERNAL_ERROR");

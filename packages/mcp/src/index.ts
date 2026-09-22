@@ -6,6 +6,7 @@ export {
   TOOLS,
   getTaskTool,
   listTasksTool,
+  submitTaskTool,
   runGuarded,
   type ReadOnlyTaskApi,
   type TaskMcpDeps,

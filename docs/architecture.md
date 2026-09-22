@@ -72,6 +72,20 @@ Dependency direction is strictly one-way: `core` depends on nothing of ours; `wo
   provider has nothing reliable to report — see [providers.md](./providers.md#usage--capacity)). This
   is what lets the CLI's `ai providers` present whatever providers are registered without
   special-casing Claude/Codex. It is a read-only report: nothing selects a provider from it.
+- **Delegated submission is detached and conservative.** MCP's `submit_task` validates an explicit
+  request, reserves one durable delegated-run marker for the canonical repository, then starts a
+  detached Node worker and returns its generated task id. The worker alone performs `createTask()`
+  and the existing sequential `run()`. The entry MCP process need not remain alive. A subsequent
+  `get_task` can report the marker's bounded `CREATING`, `RUNNING`, `FAILED`, or `FINISHED`
+  activity before or alongside a persisted `TaskRecord`. Only one delegated run may own a
+  repository at a time. A live, unknown, or stale marker blocks a new submission; stale work is
+  deliberately not recovered automatically.
+- **Delegated creation requires a clean primary checkout.** It refuses staged changes, tracked
+  edits, and non-ignored untracked paths; untracked `.ai/tasks/**` mirrors are the only exception.
+  The check runs before reservation and again inside task creation just before the baseline is
+  refreshed. This narrows, but cannot eliminate, the interval in which another process can edit the
+  checkout after the check and before Git creates the worktree. AI Engine never commits, stashes,
+  resets, restores, or cleans user work to resolve this condition.
 - **Capacity acquisition, facts, and policy are separate.** Provider adapters acquire passive local
   evidence as independent `CapacityWindow` entries. Core's `describeCapacityWindow(window, nowMs)`
   derives policy-independent observation facts; `evaluateCapacityWindow(window, nowMs, { maxAgeMs })`

@@ -6,7 +6,12 @@ import type { CallToolResult } from "@modelcontextprotocol/server";
  */
 export const TOOL_ERRORS = {
   NESTED_DELEGATION_REFUSED:
-    "AI Engine tasks cannot be read from inside an AI Engine-managed session, or from a context that cannot be verified as outside one.",
+    "AI Engine tools cannot be used from inside an AI Engine-managed session, or from a context that cannot be verified as outside one.",
+  INVALID_REQUEST: "request must be nonblank and at most 16 KiB UTF-8.",
+  DIRTY_WORKING_TREE: "The repository contains uncommitted work. No task was launched.",
+  DELEGATED_RUN_EXISTS:
+    "Delegated work already owns this repository. Inspect the existing submission; stale ownership is not automatically recovered.",
+  WORKER_LAUNCH_FAILED: "The detached worker could not be launched.",
   INVALID_TASK_ID: "taskId must be an AI Engine task id such as t-20260101000000-abcd.",
   TASK_NOT_FOUND: "No such task in this repository.",
   REPOSITORY_UNAVAILABLE: "AI Engine could not open this repository's task state.",
