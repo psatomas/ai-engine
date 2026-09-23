@@ -117,9 +117,38 @@ export class DelegatedRunStore {
     this.dir = join(dataDir, "delegated-runs", createHash("sha256").update(repoRoot).digest("hex"));
     this.active = join(this.dir, "active.json");
   }
-  private recordPath(id: string): string {
+  /**
+   * Immutable per-reservation evidence: unique to this attempt (task id + fresh nonce), so a later
+   * reservation of the same task — a continuation, or another continuation after that — never reuses
+   * an earlier attempt's path and so never overwrites its durable record.
+   */
+  private reservationPath(taskId: string, nonce: string): string {
+    if (!isSafeTaskId(taskId)) throw new Error("INVALID_TASK_ID");
+    return join(this.dir, `${taskId}.${nonce}.json`);
+  }
+  /** The one mutable pointer per task: which reservation is (or, once settled, was) this task's most recent. Refreshed on every reserve() and update(). */
+  private currentPath(id: string): string {
     if (!isSafeTaskId(id)) throw new Error("INVALID_TASK_ID");
-    return join(this.dir, `${id}.json`);
+    return join(this.dir, `${id}.current.json`);
+  }
+  /** Atomically (re)points `pointerPath` at the same content as `sourceTemp`, via link+rename — safe to call however many times, always overwriting whatever was there before. */
+  private async publishPointer(sourceTemp: string, pointerPath: string, tag: string): Promise<void> {
+    const alias = `${sourceTemp}.${tag}`;
+    await link(sourceTemp, alias);
+    try {
+      await rename(alias, pointerPath);
+    } finally {
+      await rm(alias, { force: true });
+    }
+  }
+  private async atomicWrite(path: string, record: RunRecord): Promise<void> {
+    const temp = `${path}.${randomBytes(8).toString("hex")}.tmp`;
+    await writeFile(temp, JSON.stringify(record), { mode: 0o600, flag: "wx" });
+    try {
+      await rename(temp, path);
+    } finally {
+      await rm(temp, { force: true });
+    }
   }
   private async read(path: string): Promise<RunRecord | undefined> {
     let handle;
@@ -167,7 +196,7 @@ export class DelegatedRunStore {
     }
   }
   async record(id: string): Promise<RunRecord | undefined> {
-    const record = await this.read(this.recordPath(id));
+    const record = await this.read(this.currentPath(id));
     if (record && record.taskId !== id) throw new Error("INVALID_RUN_RECORD");
     return record;
   }
@@ -176,7 +205,6 @@ export class DelegatedRunStore {
     const intent: DelegatedIntent =
       typeof requestOrIntent === "string" ? { kind: "submission", request: requestOrIntent } : requestOrIntent;
     if (!validDelegatedIntent(intent)) throw new SubmissionError("INVALID_REQUEST");
-    const path = this.recordPath(taskId);
     await mkdir(this.dir, { recursive: true, mode: 0o700 });
     const record: RunRecord = {
       taskId,
@@ -189,6 +217,7 @@ export class DelegatedRunStore {
       phase: "CREATING",
       settled: false
     };
+    const evidencePath = this.reservationPath(taskId, record.nonce);
     const temp = join(this.dir, `.reservation-${record.nonce}`);
     await writeFile(temp, JSON.stringify(record), { mode: 0o600, flag: "wx" });
     try {
@@ -198,20 +227,17 @@ export class DelegatedRunStore {
         if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new SubmissionError("DELEGATED_RUN_EXISTS");
         throw error;
       }
-      // Publish the durable activity before launch/response; never create a partial TaskRecord.
+      // Publish the durable evidence before launch/response; never create a partial TaskRecord. The
+      // evidence path is unique to this attempt, so an earlier reservation of the same task — however
+      // many times this task has been reserved before — is never touched, let alone overwritten.
       try {
-        await link(temp, path);
+        await link(temp, evidencePath);
       } catch (error) {
         await this.release(record);
         throw error;
       }
-      const latestTemp = `${temp}.latest`;
-      await link(temp, latestTemp);
-      try {
-        await rename(latestTemp, join(this.dir, "latest.json"));
-      } finally {
-        await rm(latestTemp, { force: true });
-      }
+      await this.publishPointer(temp, this.currentPath(taskId), "current");
+      await this.publishPointer(temp, join(this.dir, "latest.json"), "latest");
       return record;
     } finally {
       await rm(temp, { force: true });
@@ -223,14 +249,8 @@ export class DelegatedRunStore {
   }
   async update(record: RunRecord): Promise<void> {
     if (!(await this.owns(record))) throw new Error("RUN_OWNERSHIP_LOST");
-    const path = this.recordPath(record.taskId);
-    const temp = `${path}.${randomBytes(8).toString("hex")}.tmp`;
-    await writeFile(temp, JSON.stringify(record), { mode: 0o600, flag: "wx" });
-    try {
-      await rename(temp, path);
-    } finally {
-      await rm(temp, { force: true });
-    }
+    await this.atomicWrite(this.reservationPath(record.taskId, record.nonce), record);
+    await this.atomicWrite(this.currentPath(record.taskId), record);
   }
   async release(record: RunRecord): Promise<void> {
     if (await this.owns(record)) await rm(this.active);
@@ -241,7 +261,10 @@ export class DelegatedRunStore {
   }
   async launched(record: RunRecord, pid: number): Promise<void> {
     // Separate immutable metadata: the launcher never overwrites the worker's newer activity.
-    await writeFile(`${this.recordPath(record.taskId)}.launch`, JSON.stringify({ ...record, pid }), { flag: "wx", mode: 0o600 });
+    await writeFile(`${this.reservationPath(record.taskId, record.nonce)}.launch`, JSON.stringify({ ...record, pid }), {
+      flag: "wx",
+      mode: 0o600
+    });
   }
   async activity(id: string): Promise<SubmissionActivity | undefined> {
     let record = await this.record(id);
@@ -251,7 +274,7 @@ export class DelegatedRunStore {
     }
     if (!record) return undefined;
     if (!record.started && !record.settled) {
-      const launched = await this.read(`${this.recordPath(id)}.launch`);
+      const launched = await this.read(`${this.reservationPath(id, record.nonce)}.launch`);
       if (launched?.nonce === record.nonce) record = { ...record, pid: launched.pid };
     }
     let worker: SubmissionActivity["worker"];

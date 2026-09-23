@@ -440,3 +440,96 @@ describe("continuation — repository ownership is enforced authoritatively, not
     await expect(store().reserve("t-next", "next")).resolves.toBeDefined();
   });
 });
+
+describe("sequential continuations — the same task id can be reserved again and again", () => {
+  const seedAwaitingApproval = async (taskId: string) => {
+    const { TaskStore } = await import("./task-store.js");
+    const now = new Date().toISOString();
+    await new TaskStore(join(data, "tasks")).save({
+      id: taskId,
+      repository: { root: repo },
+      workspaceFolder: repo,
+      originalRequest: "work",
+      specification: "spec",
+      plan: "1. do it",
+      workflowState: "AWAITING_APPROVAL",
+      agentsUsed: [],
+      git: { branch: "main", commit: git("rev-parse", "HEAD").trim(), dirtyAtStart: false, untrackedAtStart: [] },
+      verification: [],
+      reviews: [],
+      approvals: [],
+      history: [{ at: now, from: "PLAN_READY", to: "AWAITING_APPROVAL", trigger: "submit_for_approval", actor: "system" }],
+      failures: [],
+      iterationCounts: {},
+      createdAt: now,
+      updatedAt: now,
+      providerSessions: {},
+      usage: {},
+      roleInvocationCounts: {},
+      usageEvents: []
+    });
+  };
+
+  /**
+   * Regression for the exact defect found live: `reserve()` used to publish a task's durable record
+   * to a path fixed by task id alone, via a hard link requiring the destination not exist — so any
+   * SECOND reservation of an already-reserved-once task (submit, then continue; or continue, then
+   * continue again) threw a raw, unwrapped EEXIST error instead of succeeding. This drives the exact
+   * submit-like-seed -> decide -> decide again -> decide a third time sequence through the real
+   * worker and a real orchestrator, with no provider involved (plan reject/resume are pure workflow
+   * transitions), and checks replay protection, evidence durability, and exclusivity throughout.
+   */
+  it("submit, decide, and decide again (twice more): reservation, replay protection, and durable evidence all survive", async () => {
+    const taskId = "t-sequential";
+    await seedAwaitingApproval(taskId);
+    const orchestrator = await api();
+
+    const decision1 = (await orchestrator.pendingDecision(taskId))!;
+    expect(decision1.kind).toBe("plan");
+    const reservation1 = await store().reserve(taskId, { kind: "continuation", decisionId: decision1.id, action: "reject" });
+    await executeDelegatedTask(reservation1.taskId, reservation1.nonce, { cwd: repo, dataDir: data, open: api });
+    expect(await store().activity(taskId)).toMatchObject({ phase: "FINISHED", worker: "finished" });
+
+    // The core bug: a second reservation of the SAME task id used to throw a raw EEXIST error here.
+    const decision2 = (await orchestrator.pendingDecision(taskId))!;
+    expect(decision2.id).not.toBe(decision1.id); // a fresh decision after the reject
+
+    // Reservation itself must now succeed even though this task was already reserved once before —
+    // but the now-stale decisionId from before the reject must still be refused end to end.
+    const staleAttempt = await store().reserve(taskId, { kind: "continuation", decisionId: decision1.id, action: "approve" });
+    expect(staleAttempt.nonce).not.toBe(reservation1.nonce);
+    await executeDelegatedTask(staleAttempt.taskId, staleAttempt.nonce, { cwd: repo, dataDir: data, open: api });
+    expect(await store().activity(taskId)).toMatchObject({ phase: "FAILED", worker: "finished", error: "STALE_DECISION" });
+
+    // The fresh decisionId succeeds on this second continuation.
+    const reservation2 = await store().reserve(taskId, { kind: "continuation", decisionId: decision2.id, action: "reject" });
+    expect(reservation2.nonce).not.toBe(reservation1.nonce);
+    expect(reservation2.nonce).not.toBe(staleAttempt.nonce);
+    await executeDelegatedTask(reservation2.taskId, reservation2.nonce, { cwd: repo, dataDir: data, open: api });
+    expect(await store().activity(taskId)).toMatchObject({ phase: "FINISHED", worker: "finished" });
+
+    // A THIRD continuation of the same task id: this isn't a one-time fix for exactly "twice".
+    const decision3 = (await orchestrator.pendingDecision(taskId))!;
+    const reservation3 = await store().reserve(taskId, { kind: "continuation", decisionId: decision3.id, action: "reject" });
+    await executeDelegatedTask(reservation3.taskId, reservation3.nonce, { cwd: repo, dataDir: data, open: api });
+    expect(await store().activity(taskId)).toMatchObject({ phase: "FINISHED", worker: "finished" });
+
+    // Prior durable run evidence is never overwritten: every earlier reservation's own record file
+    // still exists on disk after later reservations of the same task id.
+    const runsDir = join(data, "delegated-runs");
+    const subdirs = await readdir(runsDir);
+    expect(subdirs).toHaveLength(1); // one repository throughout this test
+    const files = await readdir(join(runsDir, subdirs[0]!));
+    const nonces = [reservation1.nonce, staleAttempt.nonce, reservation2.nonce, reservation3.nonce];
+    expect(new Set(nonces).size).toBe(4); // four genuinely distinct reservations
+    for (const nonce of nonces) expect(files).toContain(`${taskId}.${nonce}.json`);
+
+    // Exclusivity (one active run per repository) is unweakened by any of this: while a reservation
+    // is unsettled, no other reservation — for this task or a different one — can be made.
+    const held = await store().reserve("t-other-during-sequence", "unrelated work");
+    await expect(store().reserve(taskId, { kind: "continuation", decisionId: decision3.id, action: "approve" })).rejects.toMatchObject({
+      code: "DELEGATED_RUN_EXISTS"
+    });
+    await store().release(held);
+  });
+});
