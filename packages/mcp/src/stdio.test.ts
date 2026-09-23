@@ -175,7 +175,7 @@ describe("stdio MCP server, real orchestrator, no model", () => {
     const client = await connectStdio(child);
 
     const tools = ((await client.request("tools/list")).result!.tools as Array<{ name: string }>).map((tool) => tool.name).sort();
-    expect(tools).toEqual(["get_task", "list_tasks", "submit_task"]);
+    expect(tools).toEqual(["decide_task", "get_task", "list_tasks", "submit_task"]);
 
     const list = (await client.callTool("list_tasks")).result!;
     expect(list.isError).toBeUndefined();

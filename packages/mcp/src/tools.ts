@@ -1,12 +1,15 @@
 import { launchDetachedWorker } from "./worker-launch.js";
 import { z } from "zod";
 import type { CallToolResult } from "@modelcontextprotocol/server";
-import type { ManagedContext } from "@ai-engine/orchestrator";
+import type { DecisionOption, ManagedContext } from "@ai-engine/orchestrator";
 import {
   TASK_VIEW_LIMITS,
+  DECISION_ID_PATTERN,
   openDelegatedTaskInspection,
   submitDelegatedTask,
+  submitDelegatedContinuation,
   SubmissionError,
+  validateDecisionRequest,
   validSubmissionRequest,
   type SubmissionActivity,
   describeTask,
@@ -16,8 +19,11 @@ import {
   type PendingDecisionOutcome
 } from "@ai-engine/orchestrator";
 import { guardNestedDelegation } from "./guard.js";
-import { errorResult, successResult, ToolError } from "./results.js";
+import { errorResult, successResult, ToolError, type ToolErrorCode } from "./results.js";
 import { isSafeTaskId } from "./task-id.js";
+
+/** `decision` is a client-facing field name; kept in sync with `DecisionOption` by hand (zod needs a literal tuple, not the type). */
+const DECISION_OPTION_VALUES = ["approve", "reject", "retry", "resume", "cancel"] as const;
 
 /**
  * Everything the tools may reach. It is a compile-time narrowing of the orchestrator to its
@@ -29,9 +35,18 @@ export type ReadOnlyTaskApi = Pick<Orchestrator, "repoRoot" | "listTasks" | "get
   activity?: (taskId: string) => Promise<SubmissionActivity | undefined>;
 };
 
+/** What `decide_task` reserves and launches, once its own preflight has already validated the request. */
+export type DecideFn = (
+  taskId: string,
+  decisionId: string,
+  action: DecisionOption,
+  checkId: string | undefined
+) => Promise<SubmissionActivity>;
+
 export interface TaskMcpDeps {
   /** The managed-context detector. Defaults to the shared `detectManagedContext` on this process's own cwd and environment. */
   submit?: (request: string) => Promise<SubmissionActivity>;
+  decide?: DecideFn;
   detectContext?: () => Promise<ManagedContext>;
   /** Opens the task state of the repository this process runs in. Called only AFTER the guard has allowed a call. */
   openTasks?: () => Promise<ReadOnlyTaskApi>;
@@ -41,6 +56,7 @@ export interface TaskMcpDeps {
 
 export interface ResolvedDeps {
   submit: (request: string) => Promise<SubmissionActivity>;
+  decide: DecideFn;
   detectContext: () => Promise<ManagedContext>;
   openTasks: () => Promise<ReadOnlyTaskApi>;
   reportError: (kind: string) => void;
@@ -57,6 +73,10 @@ function defaultReportError(kind: string): void {
 export function resolveDeps(deps: TaskMcpDeps = {}): ResolvedDeps {
   return {
     submit: deps.submit ?? ((request) => submitDelegatedTask(request, { launch: launchDetachedWorker })),
+    decide:
+      deps.decide ??
+      ((taskId, decisionId, action, checkId) =>
+        submitDelegatedContinuation(taskId, decisionId, action, { checkId, launch: launchDetachedWorker })),
     detectContext: deps.detectContext ?? (() => detectManagedContext()),
     openTasks: deps.openTasks ?? defaultOpenTasks,
     reportError: deps.reportError ?? defaultReportError
@@ -65,6 +85,7 @@ export function resolveDeps(deps: TaskMcpDeps = {}): ResolvedDeps {
 
 interface ToolContext {
   submit: (request: string) => Promise<SubmissionActivity>;
+  decide: DecideFn;
   /** Opens the task state; the first call is the first thing that touches AI Engine state. */
   api: () => Promise<ReadOnlyTaskApi>;
   /** Runs a read of persisted state, mapping any failure to a stable error that carries none of its detail. */
@@ -152,8 +173,60 @@ export const submitTaskTool: ToolDefinition<z.ZodObject<{ request: z.ZodString }
   }
 };
 
+export const decideTaskTool: ToolDefinition<
+  z.ZodObject<{
+    taskId: z.ZodString;
+    decisionId: z.ZodString;
+    decision: z.ZodEnum<{ [K in (typeof DECISION_OPTION_VALUES)[number]]: K }>;
+    checkId: z.ZodOptional<z.ZodString>;
+  }>
+> = {
+  name: "decide_task",
+  mutates: true,
+  maxResponseBytes: 4096,
+  title: "Answer an AI Engine task's pending decision",
+  description:
+    "Relay one explicit, already-decided human answer (approve, reject, retry, resume, or cancel) to a task's CURRENT pending decision, " +
+    "named by the decisionId and options get_task just returned. Continues in a detached worker; inspect progress with get_task. Does not " +
+    "interpret natural language, and never approves content this interface could not show in full — get_task's pending decision then " +
+    "explains why. For a verification_approval decision, checkId is required and answers exactly that one check, never another.",
+  inputSchema: z.object({
+    taskId: z.string().describe("The task id, for example t-20260101000000-abcd."),
+    decisionId: z
+      .string()
+      .describe("The exact PendingDecision.id from a recent get_task call — binds this answer to that specific decision."),
+    decision: z.enum(DECISION_OPTION_VALUES).describe("One of the options get_task's pendingDecision.decision.options actually offered."),
+    checkId: z
+      .string()
+      .optional()
+      .describe('Required, and only meaningful, for a verification_approval decision\'s "approve": which check.')
+  }),
+  run: async ({ taskId, decisionId, decision, checkId }, { api, read, decide }) => {
+    if (!isSafeTaskId(taskId)) throw new ToolError("INVALID_TASK_ID");
+    if (!DECISION_ID_PATTERN.test(decisionId)) throw new ToolError("INVALID_DECISION_ID");
+    const opened = await api();
+    const task = await read(() => opened.getTask(taskId));
+    // A task of another repository is not this caller's to see or answer, and its existence is not revealed.
+    if (!task || task.id !== taskId || task.repository?.root !== opened.repoRoot) throw new ToolError("TASK_NOT_FOUND");
+
+    const live = await read(() => opened.pendingDecision(taskId));
+    const invalid = validateDecisionRequest(live, decisionId, decision, checkId);
+    if (invalid) throw new ToolError(invalid as ToolErrorCode);
+
+    if (decision === "approve") {
+      // The MCP presentation boundary, not the raw decision: never relay approval of content this
+      // interface could not show in full (a tighter, transport-sized bound than Unit 1's own limits).
+      const view = describeTask(task, { status: "pending", decision: live! });
+      const presented = view.pendingDecision.status === "pending" ? view.pendingDecision.decision.options : [];
+      if (!presented.includes("approve")) throw new ToolError("APPROVAL_WITHHELD");
+    }
+
+    return { activity: await decide(taskId, decisionId, decision, checkId) };
+  }
+};
+
 /** Every tool the server exposes. Each one runs through `runGuarded`, and only through it. */
-export const TOOLS = [listTasksTool, getTaskTool, submitTaskTool] as const;
+export const TOOLS = [listTasksTool, getTaskTool, submitTaskTool, decideTaskTool] as const;
 
 function errorKind(err: unknown): string {
   const name = err instanceof Error ? err.name : "";
@@ -178,6 +251,7 @@ export async function runGuarded<S extends z.ZodObject>(
   let opened: Promise<ReadOnlyTaskApi> | undefined;
   const context: ToolContext = {
     submit: deps.submit,
+    decide: deps.decide,
     api: () =>
       (opened ??= deps.openTasks().catch((err: unknown) => {
         deps.reportError(errorKind(err));

@@ -92,16 +92,18 @@ describe("protocol surface", () => {
   it("exposes inspection plus submission with accurate annotations", async () => {
     const client = await connect({ detectContext: contexts.unmanaged, openTasks: async () => fakeApi([]).api });
     const listed = (await client.request("tools/list")).result!.tools as Array<Record<string, any>>;
-    expect(listed.map((tool) => tool.name).sort()).toEqual(["get_task", "list_tasks", "submit_task"]);
-    expect(TOOLS.map((tool) => tool.name).sort()).toEqual(["get_task", "list_tasks", "submit_task"]);
-    for (const tool of listed.filter((tool) => tool.name !== "submit_task")) {
+    expect(listed.map((tool) => tool.name).sort()).toEqual(["decide_task", "get_task", "list_tasks", "submit_task"]);
+    expect(TOOLS.map((tool) => tool.name).sort()).toEqual(["decide_task", "get_task", "list_tasks", "submit_task"]);
+    for (const tool of listed.filter((tool) => tool.name !== "submit_task" && tool.name !== "decide_task")) {
       expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
     }
-    expect(listed.find((tool) => tool.name === "submit_task")!.annotations).toMatchObject({
-      readOnlyHint: false,
-      idempotentHint: false,
-      openWorldHint: true
-    });
+    for (const name of ["submit_task", "decide_task"]) {
+      expect(listed.find((tool) => tool.name === name)!.annotations).toMatchObject({
+        readOnlyHint: false,
+        idempotentHint: false,
+        openWorldHint: true
+      });
+    }
     const getTask = listed.find((tool) => tool.name === "get_task")!;
     expect(getTask.inputSchema).toMatchObject({ type: "object", properties: { taskId: { type: "string" } }, required: ["taskId"] });
     const listTasks = listed.find((tool) => tool.name === "list_tasks")!;
@@ -112,7 +114,7 @@ describe("protocol surface", () => {
     const fake = fakeApi(tasks());
     const open = vi.fn(async () => fake.api);
     const client = await connect({ detectContext: contexts.unmanaged, openTasks: open });
-    for (const name of ["advance_task", "decide_task", "run", "create_task"]) {
+    for (const name of ["advance_task", "run", "create_task"]) {
       const response = await client.callTool(name, { taskId: "t-1" });
       expect(response.error ?? response.result?.isError).toBeTruthy();
     }
@@ -218,7 +220,13 @@ describe("unmanaged context", () => {
 
 describe("nested-delegation guard", () => {
   const call = (name: string) =>
-    name === "get_task" ? { taskId: "t-20260101000000-aaaa" } : name === "submit_task" ? { request: "do work" } : {};
+    name === "get_task"
+      ? { taskId: "t-20260101000000-aaaa" }
+      : name === "submit_task"
+        ? { request: "do work" }
+        : name === "decide_task"
+          ? { taskId: "t-20260101000000-aaaa", decisionId: "pd1_" + "a".repeat(32), decision: "approve" }
+          : {};
 
   describe.each(["marker", "path", "topology", "indeterminate"] as const)("%s context", (kind) => {
     it.each(TOOLS.map((tool) => tool.name))("refuses %s before any task state is opened or read", async (name) => {
@@ -453,7 +461,8 @@ describe("bounded output", () => {
     expect(Object.fromEntries(TOOLS.map((tool) => [tool.name, tool.maxResponseBytes]))).toEqual({
       list_tasks: 64 * 1024,
       get_task: 128 * 1024,
-      submit_task: 4096
+      submit_task: 4096,
+      decide_task: 4096
     });
   });
 

@@ -4,10 +4,12 @@ export {
   MAX_GET_TASK_RESPONSE_BYTES,
   MAX_LIST_TASKS_RESPONSE_BYTES,
   TOOLS,
+  decideTaskTool,
   getTaskTool,
   listTasksTool,
   submitTaskTool,
   runGuarded,
+  type DecideFn,
   type ReadOnlyTaskApi,
   type TaskMcpDeps,
   type ToolDefinition
