@@ -3,11 +3,21 @@ import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { GitRepository } from "@ai-engine/git";
 import { createOrchestrator, DirtyWorkingTreeError } from "./orchestrator.js";
 import { resolveEnginePaths } from "@ai-engine/config";
-import { DelegatedRunStore, executeDelegatedTask, submitDelegatedTask, workerEnvironment, type WorkerLaunch } from "./delegated-run.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DecisionApplicationError } from "./orchestrator.js";
+import type { DecisionOption } from "./pending-decision.js";
+import {
+  DELEGATED_DECISION_ACTOR,
+  DelegatedRunStore,
+  executeDelegatedTask,
+  submitDelegatedContinuation,
+  submitDelegatedTask,
+  workerEnvironment,
+  type WorkerLaunch
+} from "./delegated-run.js";
 
 let scratch: string, repo: string, data: string;
 const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, stdio: ["ignore", "pipe", "pipe"] }).toString();
@@ -156,7 +166,8 @@ it("worker creates then runs sequentially and keeps the reservation through both
         expect(id).toBe(reservation.taskId);
         expect(await store().activity(id)).toMatchObject({ phase: "RUNNING" });
         return { workflowState: "AWAITING_APPROVAL" } as never;
-      })
+      }),
+      applyDecision: vi.fn()
     })
   });
   expect(calls).toEqual(["create", "run"]);
@@ -172,7 +183,7 @@ it("rechecks dirty state after launch before task creation", async () => {
 });
 it("failed creation is observable; unexpected execution failure keeps ownership", async () => {
   const reservation = await store().reserve("t-creation", "work");
-  const broken = { createTask: vi.fn().mockRejectedValue(new Error("secret")), run: vi.fn() };
+  const broken = { createTask: vi.fn().mockRejectedValue(new Error("secret")), run: vi.fn(), applyDecision: vi.fn() };
   await executeDelegatedTask(reservation.taskId, reservation.nonce, { cwd: repo, dataDir: data, open: async () => broken });
   expect(broken.run).not.toHaveBeenCalled();
   expect(await store().activity(reservation.taskId)).toMatchObject({ error: "TASK_CREATION_FAILED", worker: "finished" });
@@ -180,7 +191,11 @@ it("failed creation is observable; unexpected execution failure keeps ownership"
   await executeDelegatedTask(next.taskId, next.nonce, {
     cwd: repo,
     dataDir: data,
-    open: async () => ({ createTask: vi.fn().mockResolvedValue({}), run: vi.fn().mockRejectedValue(new Error("provider secret")) })
+    open: async () => ({
+      createTask: vi.fn().mockResolvedValue({}),
+      run: vi.fn().mockRejectedValue(new Error("provider secret")),
+      applyDecision: vi.fn()
+    })
   });
   expect(await store().activity(next.taskId)).toMatchObject({ error: "EXECUTION_FAILED", phase: "FAILED" });
   await expect(store().reserve("t-next", "next")).rejects.toMatchObject({ code: "DELEGATED_RUN_EXISTS" });
@@ -200,7 +215,7 @@ it("rejects wrong nonce and duplicate worker starts without opening the orchestr
   const first = executeDelegatedTask(record.taskId, record.nonce, {
     cwd: repo,
     dataDir: data,
-    open: async () => ({ createTask: async () => pending, run: vi.fn() })
+    open: async () => ({ createTask: async () => pending, run: vi.fn(), applyDecision: vi.fn() })
   });
   void first;
   await vi.waitFor(async () => expect((await store().record(record.taskId))!.started).toBe(true));
@@ -210,4 +225,218 @@ it("rejects wrong nonce and duplicate worker starts without opening the orchestr
 it("invalid requests do not discover repositories or launch", async () => {
   for (const request of ["", " \n", "🙂".repeat(5000)])
     await expect(submitDelegatedTask(request, { cwd: "/does-not-exist" })).rejects.toMatchObject({ code: "INVALID_REQUEST" });
+});
+
+describe("continuation intent — extends delegated runs without overloading submission", () => {
+  const decisionId = "pd1_" + "a".repeat(32);
+
+  it("reserves and returns durable CREATING activity, exactly like submission", async () => {
+    let launched!: WorkerLaunch;
+    const result = await submitDelegatedContinuation("t-continue", decisionId, "approve", {
+      checkId: "repo.deploy-check",
+      cwd: repo,
+      env: env(),
+      launch: async (input) => {
+        launched = input;
+      }
+    });
+    expect(result).toEqual({ taskId: "t-continue", phase: "CREATING", worker: "starting" });
+    expect(launched.taskId).toBe("t-continue");
+    expect(await store().activity("t-continue")).toEqual(result);
+  });
+
+  it.each([
+    ["malformed decisionId", "not-a-decision-id", "approve", undefined],
+    ["unknown action", decisionId, "explode", undefined],
+    ["overlong checkId", decisionId, "approve", "x".repeat(201)],
+    ["empty checkId", decisionId, "approve", ""]
+  ])("refuses %s before discovering a repository or launching", async (_label, id, action, checkId) => {
+    const launch = vi.fn();
+    await expect(
+      submitDelegatedContinuation("t-bad", id, action as DecisionOption, { checkId, cwd: "/does-not-exist", launch })
+    ).rejects.toMatchObject({ code: "INVALID_REQUEST" });
+    expect(launch).not.toHaveBeenCalled();
+  });
+
+  it("a submission reservation excludes a continuation, and vice versa — one active run per repository regardless of kind", async () => {
+    await submitDelegatedTask("work", { cwd: repo, env: env(), launch: vi.fn() });
+    await expect(
+      submitDelegatedContinuation("t-continue", decisionId, "approve", { checkId: "c", cwd: repo, env: env(), launch: vi.fn() })
+    ).rejects.toMatchObject({ code: "DELEGATED_RUN_EXISTS" });
+  });
+
+  it("does not require a clean working tree (unlike submission)", async () => {
+    await writeFile(join(repo, "file"), "dirty, on purpose");
+    const launch = vi.fn();
+    await expect(submitDelegatedContinuation("t-continue", decisionId, "resume", { cwd: repo, env: env(), launch })).resolves.toMatchObject(
+      { phase: "CREATING" }
+    );
+    expect(launch).toHaveBeenCalledOnce();
+  });
+
+  it("the worker applies exactly the persisted decision, with the fixed system actor, then continues via run()", async () => {
+    const reservation = await store().reserve("t-apply", { kind: "continuation", decisionId, action: "approve", checkId: "repo.check" });
+    const applyDecision = vi.fn().mockResolvedValue({});
+    const run = vi.fn().mockResolvedValue({ workflowState: "READY" });
+    await executeDelegatedTask(reservation.taskId, reservation.nonce, {
+      cwd: repo,
+      dataDir: data,
+      open: async () => ({ createTask: vi.fn(), run, applyDecision })
+    });
+    expect(applyDecision).toHaveBeenCalledWith("t-apply", decisionId, "approve", { checkId: "repo.check", by: DELEGATED_DECISION_ACTOR });
+    expect(run).toHaveBeenCalledWith("t-apply");
+    expect(await store().activity("t-apply")).toMatchObject({ phase: "FINISHED", worker: "finished" });
+  });
+
+  it("a decision without a checkId applies with checkId undefined — never a fabricated or guessed one", async () => {
+    const reservation = await store().reserve("t-apply-none", { kind: "continuation", decisionId, action: "resume" });
+    const applyDecision = vi.fn().mockResolvedValue({});
+    await executeDelegatedTask(reservation.taskId, reservation.nonce, {
+      cwd: repo,
+      dataDir: data,
+      open: async () => ({ createTask: vi.fn(), run: vi.fn().mockResolvedValue({ workflowState: "READY" }), applyDecision })
+    });
+    expect(applyDecision).toHaveBeenCalledWith("t-apply-none", decisionId, "resume", { checkId: undefined, by: DELEGATED_DECISION_ACTOR });
+  });
+
+  it.each(["STALE_DECISION", "ACTION_NOT_AVAILABLE", "CHECK_ID_REQUIRED", "CHECK_ID_INVALID", "CHECK_ID_NOT_APPLICABLE"] as const)(
+    "surfaces a %s validation failure as durable, bounded activity and never calls run()",
+    async (code) => {
+      const taskId = "t-invalid-" + code.toLowerCase().replace(/_/g, "-");
+      const reservation = await store().reserve(taskId, { kind: "continuation", decisionId, action: "approve" });
+      const run = vi.fn();
+      await executeDelegatedTask(reservation.taskId, reservation.nonce, {
+        cwd: repo,
+        dataDir: data,
+        open: async () => ({
+          createTask: vi.fn(),
+          run,
+          applyDecision: vi.fn().mockRejectedValue(new DecisionApplicationError(code, reservation.taskId))
+        })
+      });
+      expect(run).not.toHaveBeenCalled();
+      expect(await store().activity(reservation.taskId)).toMatchObject({ phase: "FAILED", worker: "finished", error: code });
+      // Fully settled and released: a fresh reservation is possible right away.
+      await expect(store().reserve("t-next-after-" + code.toLowerCase().replace(/_/g, "-"), "next")).resolves.toBeDefined();
+    }
+  );
+
+  it("an unexpected (non-DecisionApplicationError) failure applying the decision is bounded as DECISION_APPLICATION_FAILED", async () => {
+    const reservation = await store().reserve("t-unexpected", { kind: "continuation", decisionId, action: "approve", checkId: "c" });
+    const run = vi.fn();
+    await executeDelegatedTask(reservation.taskId, reservation.nonce, {
+      cwd: repo,
+      dataDir: data,
+      open: async () => ({ createTask: vi.fn(), run, applyDecision: vi.fn().mockRejectedValue(new Error("filesystem secret /etc/passwd")) })
+    });
+    expect(run).not.toHaveBeenCalled();
+    const activity = await store().activity(reservation.taskId);
+    expect(activity).toMatchObject({ phase: "FAILED", error: "DECISION_APPLICATION_FAILED" });
+    expect(JSON.stringify(activity)).not.toMatch(/secret|passwd/);
+  });
+
+  it("a failure once running (inside run()) is EXECUTION_FAILED, exactly like submission", async () => {
+    const reservation = await store().reserve("t-exec-fail", { kind: "continuation", decisionId, action: "retry" });
+    await executeDelegatedTask(reservation.taskId, reservation.nonce, {
+      cwd: repo,
+      dataDir: data,
+      open: async () => ({
+        createTask: vi.fn(),
+        applyDecision: vi.fn().mockResolvedValue({}),
+        run: vi.fn().mockRejectedValue(new Error("boom"))
+      })
+    });
+    expect(await store().activity(reservation.taskId)).toMatchObject({ phase: "FAILED", error: "EXECUTION_FAILED" });
+  });
+
+  it("a run that ends in FAILED workflow state is reported the same way for a continuation as for a submission", async () => {
+    const reservation = await store().reserve("t-workflow-failed", { kind: "continuation", decisionId, action: "cancel" });
+    await executeDelegatedTask(reservation.taskId, reservation.nonce, {
+      cwd: repo,
+      dataDir: data,
+      open: async () => ({
+        createTask: vi.fn(),
+        applyDecision: vi.fn().mockResolvedValue({}),
+        run: vi.fn().mockResolvedValue({ workflowState: "FAILED" })
+      })
+    });
+    expect(await store().activity(reservation.taskId)).toMatchObject({ phase: "FAILED", error: "EXECUTION_FAILED" });
+  });
+
+  it("a stored continuation record round-trips exactly through read()/reserve(), including checkId's absence", async () => {
+    await store().reserve("t-roundtrip", { kind: "continuation", decisionId, action: "cancel" });
+    const record = await store().record("t-roundtrip");
+    expect(record).toMatchObject({ taskId: "t-roundtrip", intent: { kind: "continuation", decisionId, action: "cancel" } });
+    expect(record!.intent).not.toHaveProperty("checkId");
+  });
+});
+
+describe("continuation — repository ownership is enforced authoritatively, not just by the MCP caller", () => {
+  const foreignDecisionId = "pd1_" + "b".repeat(32);
+
+  it("a direct continuation reservation for a foreign-repository task reserves and launches, but the real worker refuses before applying anything, and releases ownership", async () => {
+    const otherRepo = join(scratch, "other-repo");
+    await mkdir(otherRepo);
+    const otherGit = (...args: string[]) => execFileSync("git", args, { cwd: otherRepo, stdio: ["ignore", "pipe", "pipe"] }).toString();
+    otherGit("init", "-q");
+    otherGit("config", "user.email", "test@example.com");
+    otherGit("config", "user.name", "Test");
+    await writeFile(join(otherRepo, "file"), "initial");
+    otherGit("add", ".");
+    otherGit("commit", "-qm", "initial");
+
+    // A real task that genuinely belongs to otherRepo, stored in the data dir the continuation below will share.
+    const { TaskStore } = await import("./task-store.js");
+    const foreignTaskId = "t-foreign-0000000-aaaa";
+    const now = new Date().toISOString();
+    await new TaskStore(join(data, "tasks")).save({
+      id: foreignTaskId,
+      repository: { root: otherRepo },
+      workspaceFolder: otherRepo,
+      originalRequest: "work elsewhere",
+      workflowState: "AWAITING_APPROVAL",
+      specification: "spec",
+      plan: "1. do it",
+      agentsUsed: [],
+      git: { branch: "main", commit: otherGit("rev-parse", "HEAD").trim(), dirtyAtStart: false, untrackedAtStart: [] },
+      verification: [],
+      reviews: [],
+      approvals: [],
+      history: [{ at: now, from: "PLAN_READY", to: "AWAITING_APPROVAL", trigger: "submit_for_approval", actor: "system" }],
+      failures: [],
+      iterationCounts: {},
+      createdAt: now,
+      updatedAt: now,
+      providerSessions: {},
+      usage: {},
+      roleInvocationCounts: {},
+      usageEvents: []
+    });
+    const before = await new TaskStore(join(data, "tasks")).get(foreignTaskId);
+
+    // A direct, internal continuation attempt against `repo` (NOT otherRepo) for that foreign task —
+    // no MCP preflight anywhere in this test. Reservation is scoped to `repo`, so it succeeds; only
+    // the worker, opening an orchestrator FOR `repo`, is positioned to know the task doesn't belong to it.
+    const activity = await submitDelegatedContinuation(foreignTaskId, foreignDecisionId, "approve", {
+      checkId: undefined,
+      cwd: repo,
+      env: env(),
+      launch: vi.fn()
+    });
+    expect(activity).toMatchObject({ phase: "CREATING", worker: "starting" });
+
+    const reservation = (await store().record(foreignTaskId))!;
+    // The worker opens a REAL orchestrator for `repo` (not `otherRepo`) — exactly what the detached
+    // worker process does for whatever repository it was actually launched into.
+    await executeDelegatedTask(reservation.taskId, reservation.nonce, { cwd: repo, dataDir: data, open: api });
+
+    const finalActivity = await store().activity(foreignTaskId);
+    expect(finalActivity).toMatchObject({ phase: "FAILED", worker: "finished", error: "STALE_DECISION" });
+    expect(JSON.stringify(finalActivity)).not.toContain(otherRepo);
+    expect(JSON.stringify(finalActivity)).not.toContain(repo);
+    // No decision method ran: the foreign task is byte-for-byte unchanged.
+    expect(await new TaskStore(join(data, "tasks")).get(foreignTaskId)).toEqual(before);
+    // Ownership was released: ordinary submission/continuation work against `repo` is not blocked by this.
+    await expect(store().reserve("t-next", "next")).resolves.toBeDefined();
+  });
 });
