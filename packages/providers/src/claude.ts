@@ -16,7 +16,7 @@ import type {
 import { withManagedTaskMarker } from "@ai-engine/core";
 import type { Logger } from "@ai-engine/logging";
 import { resolveProviderBinary } from "./resolve.js";
-import { composeUserPrompt } from "./prompt.js";
+import { composeUserPromptParts, promptFootprint } from "./prompt.js";
 import { AsyncQueue } from "./async-queue.js";
 import { readClaudeCapacity } from "./claude-capacity.js";
 
@@ -97,7 +97,8 @@ function permissionModeForSandbox(_level: SandboxLevel): string {
 export function buildInvocationArgs(
   request: AgentInvocationRequest,
   options: Pick<ClaudeAdapterOptions, "denyNetworkTools" | "extraArgs" | "defaultModel">,
-  sessionId: string
+  sessionId: string,
+  serializedOutputSchema: string | undefined = request.outputSchema ? JSON.stringify(request.outputSchema) : undefined
 ): string[] {
   const args: string[] = ["-p", "--output-format", "stream-json", "--verbose"];
   args.push("--permission-mode", permissionModeForSandbox(request.sandbox));
@@ -110,7 +111,7 @@ export function buildInvocationArgs(
   if (request.resumeSessionId) args.push("--resume", request.resumeSessionId);
   else args.push("--session-id", sessionId);
   if (request.maxCostUsd) args.push("--max-budget-usd", String(request.maxCostUsd));
-  if (request.outputSchema) args.push("--json-schema", JSON.stringify(request.outputSchema));
+  if (serializedOutputSchema !== undefined) args.push("--json-schema", serializedOutputSchema);
   if (options.defaultModel) args.push("--model", options.defaultModel);
   args.push(...(options.extraArgs ?? []));
   return args;
@@ -276,8 +277,17 @@ export class ClaudeProvider implements ProviderAdapter {
   ): Promise<AgentResult> {
     const binary = await this.resolveBinary();
     const sessionId = request.resumeSessionId ?? randomUUID();
-    const args = buildInvocationArgs(request, this.options, sessionId);
-    const prompt = composeUserPrompt(request);
+    const serializedOutputSchema = request.outputSchema ? JSON.stringify(request.outputSchema) : undefined;
+    const args = buildInvocationArgs(request, this.options, sessionId, serializedOutputSchema);
+    const composed = composeUserPromptParts(request);
+    const prompt = composed.userPrompt;
+    const footprint = promptFootprint(
+      request,
+      composed,
+      `${request.systemPrompt.trim()}${prompt}`,
+      request.systemPrompt.trim(),
+      serializedOutputSchema
+    );
 
     queue.push({ type: "lifecycle", phase: "started", at: new Date().toISOString() });
 
@@ -371,6 +381,7 @@ export class ClaudeProvider implements ProviderAdapter {
       structuredOutput,
       providerSessionId: providerSessionId ?? sessionId,
       usage,
+      promptFootprint: footprint,
       error:
         status === "failure"
           ? { code: "CLAUDE_EXEC_FAILED", message: execResult.stderr?.trim() || finalMessage || "claude -p exited with an error" }

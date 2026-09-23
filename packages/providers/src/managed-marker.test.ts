@@ -61,6 +61,13 @@ async function invoke(make: (typeof providers)[number][1], req: AgentInvocationR
   return recorded.calls[0]!;
 }
 
+async function invokeResult(make: (typeof providers)[number][1], req: AgentInvocationRequest) {
+  const run = make().invoke(req);
+  const result = await run.result;
+  expect(recorded.calls).toHaveLength(1);
+  return { call: recorded.calls[0]!, result };
+}
+
 describe.each(providers)("%s managed invocation", (_name, make) => {
   it("launches the provider with the actual task id in AI_ENGINE_MANAGED_TASK", async () => {
     const call = await invoke(make, request({ taskId: "t-20260305123456-beef" }));
@@ -136,6 +143,41 @@ describe("Claude resumed invocation", () => {
     const call = await invoke(providers[0][1], request({ resumeSessionId: "some-session" }));
     expect(call.args).toContain("--resume");
     expect((call.options.env as NodeJS.ProcessEnv).AI_ENGINE_MANAGED_TASK).toBe("t-20260101000000-abcd");
+  });
+});
+
+describe.each(providers)("%s prompt footprint", (_name, make) => {
+  it("returns byte-only prompt metadata for the exact prompt it supplies, separately from provider usage", async () => {
+    const req = request({
+      role: "architect",
+      systemPrompt: "System 🧭",
+      instructions: "Inspect café",
+      context: [{ trust: "repository_content", label: "secret-label", content: "secret context 🐙" }],
+      outputSchema: { type: "object", properties: { result: { type: "string" } } },
+      resumeSessionId: "prior-session"
+    });
+    const { call, result } = await invokeResult(make, req);
+    const footprint = result.promptFootprint!;
+    const sentUserPrompt = String(call.options.input);
+
+    expect(footprint.systemPolicyBytes).toBe(Buffer.byteLength("System 🧭", "utf8"));
+    expect(footprint.contextBlockCount).toBe(1);
+    expect(footprint.contextBytes).toBeGreaterThan(Buffer.byteLength("secret context 🐙", "utf8"));
+    expect(footprint.structuredOutputSchemaBytes).toBe(Buffer.byteLength(JSON.stringify(req.outputSchema), "utf8"));
+    expect(footprint.resumedProviderSession).toBe(true);
+    expect(result.usage).toBeUndefined();
+    expect(JSON.stringify(footprint)).not.toContain("secret context 🐙");
+    expect(JSON.stringify(footprint)).not.toContain("secret-label");
+
+    if (_name === "Codex") {
+      // Codex has one stdin channel: the actual final input includes its labelled system wrapper.
+      expect(footprint.explicitPromptBytes).toBe(Buffer.byteLength(sentUserPrompt, "utf8"));
+      expect(footprint.userPromptBytes).toBeLessThan(footprint.explicitPromptBytes);
+    } else {
+      // Claude receives the user body on stdin and the policy through a separate CLI argument.
+      expect(footprint.userPromptBytes).toBe(Buffer.byteLength(sentUserPrompt, "utf8"));
+      expect(footprint.explicitPromptBytes).toBe(Buffer.byteLength("System 🧭", "utf8") + Buffer.byteLength(sentUserPrompt, "utf8"));
+    }
   });
 });
 

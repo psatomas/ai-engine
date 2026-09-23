@@ -24,6 +24,31 @@ export interface ObservedUsage {
 }
 
 /**
+ * AI Engine's measured footprint for material supplied to one provider invocation.
+ *
+ * This is deliberately separate from `ObservedUsage`: these are UTF-8 byte counts
+ * measured locally from the final strings AI Engine supplies, while `ObservedUsage`
+ * is provider-reported token/cost telemetry. Neither is an estimate of the other.
+ * No prompt, schema, context text, argv, path, or environment value is retained.
+ */
+export interface PromptFootprint {
+  /** Total UTF-8 bytes of AI Engine-authored prompt material supplied across the provider's native prompt channels. */
+  explicitPromptBytes: number;
+  /** UTF-8 bytes of the system-policy material, when the adapter supplies it independently. */
+  systemPolicyBytes?: number;
+  /** UTF-8 bytes of the final user/request body supplied by the adapter. */
+  userPromptBytes: number;
+  /** UTF-8 bytes of the rendered, trust-labelled context material inside the user body. */
+  contextBytes: number;
+  /** Number of context blocks represented by `contextBytes`. */
+  contextBlockCount: number;
+  /** Whether this invocation asked the provider to resume a previously recorded native session. */
+  resumedProviderSession: boolean;
+  /** UTF-8 bytes of the serialized structured-output schema, when one was supplied. */
+  structuredOutputSchemaBytes?: number;
+}
+
+/**
  * One fully-attributed record of observed usage for exactly one AI Engine
  * invocation (one `ProviderAdapter.invoke()` call and its resulting
  * `AgentResult`). This is the leaf of the Task -> provider -> role ->
@@ -45,6 +70,8 @@ export interface UsageEvent {
   role: string;
   operation: string;
   usage: ObservedUsage;
+  /** Locally measured AI Engine prompt material; absent on records persisted before this field existed. */
+  promptFootprint?: PromptFootprint;
 }
 
 export type UsageTotals = ObservedUsage & { invocations: number };

@@ -1157,7 +1157,14 @@ export class Orchestrator {
     if (result.usage?.inputTokens !== undefined) usage.totalInputTokens = (usage.totalInputTokens ?? 0) + result.usage.inputTokens;
     if (result.usage?.outputTokens !== undefined) usage.totalOutputTokens = (usage.totalOutputTokens ?? 0) + result.usage.outputTokens;
 
-    const usageEvent: UsageEvent = { at: new Date().toISOString(), providerId, role, operation, usage: result.usage ?? {} };
+    const usageEvent: UsageEvent = {
+      at: new Date().toISOString(),
+      providerId,
+      role,
+      operation,
+      usage: result.usage ?? {},
+      ...(result.promptFootprint === undefined ? {} : { promptFootprint: result.promptFootprint })
+    };
 
     return {
       ...task,

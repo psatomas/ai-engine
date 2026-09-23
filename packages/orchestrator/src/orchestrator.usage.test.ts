@@ -167,6 +167,54 @@ describe("usage telemetry, recorded end-to-end through a real Orchestrator", () 
     expect(securityReviewerEvents[0]!.providerId).toBe("mock");
   });
 
+  it("persists byte-only prompt footprint beside, never inside, provider-reported token usage", async () => {
+    const provider = new MockProvider("mock", (request) => ({
+      status: "success",
+      structuredOutput: { specification: "SPEC", plan: "PLAN", risks: [] },
+      usage: { inputTokens: 100, cachedInputTokens: 70, outputTokens: 10 },
+      promptFootprint: {
+        explicitPromptBytes: 1036,
+        systemPolicyBytes: 728,
+        userPromptBytes: 220,
+        contextBytes: 0,
+        contextBlockCount: 0,
+        resumedProviderSession: Boolean(request.resumeSessionId),
+        structuredOutputSchemaBytes: 215
+      }
+    }));
+    const orchestrator = await buildOrchestrator({ provider });
+    const created = await orchestrator.createTask("request text");
+    const task = await orchestrator.run(created.id);
+    const event = task.usageEvents[0]!;
+
+    expect(event.usage).toEqual({ inputTokens: 100, cachedInputTokens: 70, outputTokens: 10 });
+    expect(event.promptFootprint).toEqual({
+      explicitPromptBytes: 1036,
+      systemPolicyBytes: 728,
+      userPromptBytes: 220,
+      contextBytes: 0,
+      contextBlockCount: 0,
+      resumedProviderSession: false,
+      structuredOutputSchemaBytes: 215
+    });
+    const persisted = await readFile(join(dataDir, "tasks", `${task.id}.json`), "utf8");
+    expect(persisted).toContain('"promptFootprint"');
+    expect(JSON.stringify(event.promptFootprint)).not.toContain("request text");
+  });
+
+  it("loads a persisted usage event that predates prompt footprint observability", async () => {
+    const orchestrator = await buildOrchestrator();
+    const task = await orchestrator.createTask("Add a feature");
+    const taskPath = join(dataDir, "tasks", `${task.id}.json`);
+    const raw = JSON.parse(await readFile(taskPath, "utf8"));
+    raw.usageEvents = [
+      { at: "2026-01-01T00:00:00.000Z", providerId: "mock", role: "architect", operation: "analyze", usage: { inputTokens: 1 } }
+    ];
+    await writeFile(taskPath, JSON.stringify(raw, null, 2), "utf8");
+
+    expect((await orchestrator.getTask(task.id))?.usageEvents).toEqual(raw.usageEvents);
+  });
+
   it("a single provider filling multiple roles aggregates correctly per role and per provider", async () => {
     const orchestrator = await buildOrchestrator();
     let task = await orchestrator.createTask("Add a feature");

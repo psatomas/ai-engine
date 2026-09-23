@@ -1,6 +1,6 @@
 import type { Capability } from "./roles.js";
 import type { ContextBlock } from "./trust.js";
-import type { ObservedUsage } from "./usage.js";
+import type { ObservedUsage, PromptFootprint } from "./usage.js";
 
 /**
  * A provider is an external coding-agent product (Codex, Claude Code,
@@ -70,6 +70,8 @@ export interface AgentResult {
   commandsRun?: Array<{ command: string; exitCode: number | null }>;
   /** Observed usage for this single invocation — see ObservedUsage in usage.ts for the "unknown, not zero" contract. */
   usage?: ObservedUsage;
+  /** Locally measured AI Engine prompt material, distinct from provider-reported token usage. */
+  promptFootprint?: PromptFootprint;
   /**
    * For a provider whose native usage reporting is cumulative-per-thread (see
    * `previousCumulativeUsage` on `AgentInvocationRequest`), the raw new cumulative total observed

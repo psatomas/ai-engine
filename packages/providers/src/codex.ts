@@ -19,7 +19,7 @@ import type {
 import { subtractObservedUsage, withManagedTaskMarker } from "@ai-engine/core";
 import type { Logger } from "@ai-engine/logging";
 import { resolveProviderBinary } from "./resolve.js";
-import { composeUserPrompt } from "./prompt.js";
+import { composeUserPromptParts, promptFootprint } from "./prompt.js";
 import { AsyncQueue } from "./async-queue.js";
 import { readCodexCapacity } from "./codex-capacity.js";
 
@@ -409,9 +409,10 @@ export class CodexProvider implements ProviderAdapter {
     let schemaFile: string | undefined;
 
     try {
-      if (request.outputSchema) {
+      const serializedOutputSchema = request.outputSchema ? JSON.stringify(request.outputSchema) : undefined;
+      if (serializedOutputSchema !== undefined) {
         schemaFile = join(tmpDir, "schema.json");
-        await writeFile(schemaFile, JSON.stringify(request.outputSchema), "utf8");
+        await writeFile(schemaFile, serializedOutputSchema, "utf8");
       }
       const built = buildCodexArgs(request, { outputLastMessageFile: lastMessageFile, schemaFile }, this.options);
       if ("error" in built) {
@@ -433,14 +434,15 @@ export class CodexProvider implements ProviderAdapter {
       // rather than silently concatenating two different authority levels with no marker at all.
       // See docs/providers.md and docs/security.md for why this is a known, accepted limitation
       // for Codex-filled roles rather than something this adapter can structurally fix.
+      const systemPolicy = request.systemPrompt.trim();
+      const composed = composeUserPromptParts(request);
       const prompt = [
-        request.systemPrompt.trim()
-          ? `=== SYSTEM POLICY (ai-engine; not from this repository) ===\n${request.systemPrompt.trim()}\n=== END SYSTEM POLICY ===`
-          : "",
-        composeUserPrompt(request)
+        systemPolicy ? `=== SYSTEM POLICY (ai-engine; not from this repository) ===\n${systemPolicy}\n=== END SYSTEM POLICY ===` : "",
+        composed.userPrompt
       ]
         .filter(Boolean)
         .join("\n\n");
+      const footprint = promptFootprint(request, composed, prompt, systemPolicy, serializedOutputSchema);
 
       queue.push({ type: "lifecycle", phase: "started", at: new Date().toISOString() });
 
@@ -547,6 +549,7 @@ export class CodexProvider implements ProviderAdapter {
         providerSessionId,
         commandsRun,
         usage: codexInvocationUsage(rawCumulativeUsage, resuming, request.previousCumulativeUsage),
+        promptFootprint: footprint,
         cumulativeUsageBaseline: rawCumulativeUsage,
         error:
           status === "failure"
