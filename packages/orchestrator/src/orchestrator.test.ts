@@ -14,6 +14,7 @@ import { TaskStore } from "./task-store.js";
 import { RoleRegistry, type ProviderFactory } from "./role-registry.js";
 import { Orchestrator, IllegalTaskStateError } from "./orchestrator.js";
 import { MockProvider } from "./test-support/mock-provider.js";
+import { ArchitectJsonSchema } from "./output-schemas.js";
 
 let repoDir: string;
 let dataDir: string;
@@ -110,6 +111,34 @@ afterEach(async () => {
 });
 
 describe("Orchestrator end-to-end (mock providers, real git + workflow)", () => {
+  it("keeps the architect request verbatim while leaving its policy, schema, context, and approval boundary intact", async () => {
+    const provider = new MockProvider("mock", mockResponder);
+    const orchestrator = await buildOrchestrator({}, provider);
+    const originalRequest = "Read only: inspect package.json and return a concise specification and one-step plan. Do not edit any files.";
+
+    const task = await orchestrator.createTask(originalRequest);
+    const result = await orchestrator.run(task.id);
+    const architectRequest = provider.invocations.find((invocation) => invocation.role === "architect")?.request;
+
+    expect(architectRequest).toBeDefined();
+    expect(architectRequest!.instructions).toBe(
+      `Original request from the operator:\n\n${originalRequest}\n\nAnalyze this request against the repository.`
+    );
+    expect(architectRequest!.instructions).not.toContain("Analyze this against the repository and produce a specification and plan.");
+    expect(architectRequest!.systemPrompt).toContain("SPECIFICATION");
+    expect(architectRequest!.systemPrompt).toContain("PLAN");
+    expect(architectRequest!.outputSchema).toEqual(ArchitectJsonSchema);
+    expect(architectRequest!.context).toEqual([]);
+
+    const finalCodexPrompt = [
+      `=== SYSTEM POLICY (ai-engine; not from this repository) ===\n${architectRequest!.systemPrompt.trim()}\n=== END SYSTEM POLICY ===`,
+      architectRequest!.instructions
+    ].join("\n\n");
+    expect(Buffer.byteLength(architectRequest!.instructions, "utf8")).toBe(191);
+    expect(Buffer.byteLength(finalCodexPrompt, "utf8")).toBe(1007);
+    expect(result.workflowState).toBe("AWAITING_APPROVAL");
+  });
+
   it("drives a task through the full pipeline to READY, pausing at each approval gate", async () => {
     const orchestrator = await buildOrchestrator();
 

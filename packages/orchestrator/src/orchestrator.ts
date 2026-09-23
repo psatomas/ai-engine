@@ -298,7 +298,7 @@ export class Orchestrator {
 
       const context = await loadProjectContext(this.repoRoot);
       const request = await this.buildRequest(task, WellKnownRole.Architect, {
-        instructions: `Original request from the operator:\n\n${task.originalRequest}\n\nAnalyze this against the repository and produce a specification and plan.`,
+        instructions: `Original request from the operator:\n\n${task.originalRequest}\n\nAnalyze this request against the repository.`,
         context,
         outputSchema: ArchitectJsonSchema
       });
