@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import { join } from "node:path";
 import {
   WellKnownRole,
@@ -40,7 +41,14 @@ import { loadProjectContext } from "./project-context.js";
 import { writeTaskSummary } from "./task-summary.js";
 import { ArchitectJsonSchema, ReviewJsonSchema, tryParseArchitectOutput, tryParseReviewOutput } from "./output-schemas.js";
 import { prepareWorktreeDependencies } from "./dependency-setup.js";
-import { derivePendingDecision, requiresCheckLookup, type PendingDecision } from "./pending-decision.js";
+import {
+  derivePendingDecision,
+  requiresCheckLookup,
+  validateDecisionRequest,
+  type DecisionOption,
+  type DecisionValidationErrorCode,
+  type PendingDecision
+} from "./pending-decision.js";
 
 const DIFF_CONTEXT_MAX_CHARS = 40_000;
 
@@ -48,10 +56,52 @@ function truncate(text: string, max: number): string {
   return text.length > max ? text.slice(0, max) + "\n...[truncated]" : text;
 }
 
+/**
+ * Whether two repository-root paths name the same real, on-disk repository — the one canonical
+ * comparison every repository-ownership check in this file uses, rather than each comparing raw
+ * strings its own way. Compared via `realpath` so a symlinked spelling of either side (or one that
+ * simply differs cosmetically, e.g. a trailing slash) cannot fool it, matching this codebase's
+ * existing canonical-path conventions elsewhere (see @ai-engine/orchestrator's managed-context
+ * detector). Fails closed: if either path cannot be resolved right now — deleted, unmounted,
+ * momentarily unreadable — they are NOT considered the same repository. Never throws.
+ */
+async function sameRepository(a: string, b: string): Promise<boolean> {
+  try {
+    const [realA, realB] = await Promise.all([realpath(a), realpath(b)]);
+    return realA === realB;
+  } catch {
+    return false;
+  }
+}
+
 export class IllegalTaskStateError extends Error {
   constructor(taskId: string, actual: WorkflowState, expected: WorkflowState[]) {
     super(`Task "${taskId}" is in state ${actual}, expected one of: ${expected.join(", ")}`);
     this.name = "IllegalTaskStateError";
+  }
+}
+
+/**
+ * A caller's `expectedDecisionId` no longer matches the live `PendingDecision` — the decision was
+ * answered, replaced, or moved on since the caller read it. Thrown from inside the task's lock,
+ * immediately before the state change would otherwise be applied, so a stale or replayed answer
+ * can never affect whatever decision is actually current. Carries no decision content.
+ */
+export class StaleDecisionError extends Error {
+  constructor(taskId: string) {
+    super(`Task "${taskId}"'s pending decision no longer matches the one being answered.`);
+    this.name = "StaleDecisionError";
+  }
+}
+
+/** `applyDecision` could not map the requested action onto the live decision — see `DecisionValidationErrorCode`. */
+export class DecisionApplicationError extends Error {
+  constructor(
+    public readonly code: DecisionValidationErrorCode,
+    taskId: string
+  ) {
+    super(`Task "${taskId}"'s requested decision is invalid: ${code}`);
+    this.name = "DecisionApplicationError";
   }
 }
 
@@ -329,9 +379,16 @@ export class Orchestrator {
     });
   }
 
-  async decidePlan(taskId: string, decision: "approved" | "rejected", by: string, note?: string): Promise<TaskRecord> {
+  async decidePlan(
+    taskId: string,
+    decision: "approved" | "rejected",
+    by: string,
+    note?: string,
+    expectedDecisionId?: string
+  ): Promise<TaskRecord> {
     return this.withTaskLock(taskId, async () => {
       let task = await this.deps.taskStore.requireTask(taskId);
+      await this.assertExpectedDecision(task, expectedDecisionId);
       this.assertState(task, ["AWAITING_APPROVAL"]);
       task = this.deps.workflow.apply(task, decision === "approved" ? "approve" : "reject", "human", this.attribute(by, note));
       task = { ...task, approvals: [...task.approvals, { gate: "plan", decision, by, at: new Date().toISOString(), note }] };
@@ -495,9 +552,17 @@ export class Orchestrator {
   }
 
   /** Resolves a gate opened by `review()` (currently: security_review). */
-  async decideGate(taskId: string, gate: string, decision: "approved" | "rejected", by: string, note?: string): Promise<TaskRecord> {
+  async decideGate(
+    taskId: string,
+    gate: string,
+    decision: "approved" | "rejected",
+    by: string,
+    note?: string,
+    expectedDecisionId?: string
+  ): Promise<TaskRecord> {
     return this.withTaskLock(taskId, async () => {
       let task = await this.deps.taskStore.requireTask(taskId);
+      await this.assertExpectedDecision(task, expectedDecisionId);
       if (task.workflowState !== "PAUSED" || task.pendingGate !== gate) {
         throw new Error(
           `Task "${taskId}" has no pending "${gate}" gate (state=${task.workflowState}, pendingGate=${task.pendingGate ?? "none"})`
@@ -635,10 +700,12 @@ export class Orchestrator {
     taskId: string,
     checkId: string,
     by: string,
-    note?: string
+    note?: string,
+    expectedDecisionId?: string
   ): Promise<{ task: TaskRecord; command: string }> {
     return this.withTaskLock(taskId, async () => {
       let task = await this.deps.taskStore.requireTask(taskId);
+      await this.assertExpectedDecision(task, expectedDecisionId);
       const cwd = task.git.worktreePath ?? task.workspaceFolder;
       const { checks: autoChecks } = await detectChecks(cwd);
       const { checks: allChecks } = this.applyVerificationOverrides(autoChecks, cwd);
@@ -685,12 +752,88 @@ export class Orchestrator {
    * `PendingDecision.id` to detect that the decision moved on since it was read.
    */
   async pendingDecision(taskId: string): Promise<PendingDecision | undefined> {
-    const task = await this.deps.taskStore.requireTask(taskId);
-    const checks = requiresCheckLookup(task) ? await this.listVerificationChecks(taskId) : undefined;
+    return this.computeDecision(await this.deps.taskStore.requireTask(taskId));
+  }
+
+  /** The pure derivation `pendingDecision()` wraps, taking an already-loaded task — so a caller that
+   *  loaded `task` under the task lock (to revalidate immediately before applying a decision to it)
+   *  computes the live decision from that SAME loaded record, not a second, potentially different read. */
+  private async computeDecision(task: TaskRecord): Promise<PendingDecision | undefined> {
+    const checks = requiresCheckLookup(task) ? await this.listVerificationChecks(task.id) : undefined;
     return derivePendingDecision(task, {
       canApply: (trigger, from) => this.deps.workflow.canApply(from ? { ...task, workflowState: from } : task, trigger),
       checks
     });
+  }
+
+  /**
+   * The authoritative replay/staleness guard: called from inside `withTaskLock`, immediately after
+   * loading `task` and before any of a decision method's own state assertions or mutations. A caller
+   * outside the lock (an MCP preflight, `applyDecision`'s own dispatch read) may have validated
+   * against a decision that has since moved on — this is the check that cannot be raced, because
+   * nothing else can mutate `task` between this read and the mutation that follows it in the same
+   * lock. `undefined` (the default for every existing caller) skips the check entirely, so this is
+   * fully backward compatible.
+   */
+  private async assertExpectedDecision(task: TaskRecord, expectedDecisionId: string | undefined): Promise<void> {
+    if (expectedDecisionId === undefined) return;
+    const live = await this.computeDecision(task);
+    if (!live || live.id !== expectedDecisionId) throw new StaleDecisionError(task.id);
+  }
+
+  /**
+   * Answers exactly the pending decision named by `decisionId`, mapping `action` (and, for a
+   * verification approval, `checkId`) onto the one existing orchestrator API that already
+   * implements it — `decidePlan`, `decideGate`, `resume`, `retry`, `cancel`, or
+   * `approveVerificationCommand` — never a new, parallel state transition. This is a decision
+   * *relay*: the legality of the transition, and the transition itself, remain entirely those
+   * methods' own.
+   *
+   * This is the authoritative boundary for a delegated continuation, so it enforces repository
+   * ownership itself rather than trusting a caller to have checked it: `task.repository.root` (set
+   * once, at creation, and never mutated afterward) must name the SAME repository as this
+   * orchestrator's own (`sameRepository`, a canonical, realpath-based comparison — never a raw
+   * string compare, and never anything derived from a caller-supplied path). A mismatch is reported
+   * as `STALE_DECISION`, identically to a genuinely stale one: this method never reveals whether a
+   * foreign taskId exists, let alone where it actually lives. This holds for every caller of this
+   * method, not just the ones that route through an MCP preflight or the delegated-run worker.
+   *
+   * The read here (to pick which method to call, and with what arguments — e.g. a gate's name, or
+   * which check `checkId` must belong to) is an ordinary, lock-free snapshot and may be stale by
+   * the time the chosen method actually runs; that is fine, because every one of those methods
+   * re-validates `expectedDecisionId` (see `assertExpectedDecision`) under its own task lock,
+   * immediately before applying anything. A mismatch here or there always throws — a stale,
+   * replaced, or replayed decision can never take effect, and never replaces a newer one.
+   */
+  async applyDecision(
+    taskId: string,
+    decisionId: string,
+    action: DecisionOption,
+    options: { checkId?: string; by: string; note?: string }
+  ): Promise<TaskRecord> {
+    const task = await this.deps.taskStore.requireTask(taskId);
+    if (!(await sameRepository(task.repository.root, this.repoRoot))) throw new DecisionApplicationError("STALE_DECISION", taskId);
+    const decision = await this.computeDecision(task);
+    const invalid = validateDecisionRequest(decision, decisionId, action, options.checkId);
+    if (invalid || !decision) throw new DecisionApplicationError(invalid ?? "STALE_DECISION", taskId);
+    const { checkId, by, note } = options;
+
+    if (action === "cancel") return this.cancel(taskId, by, note, decisionId);
+    switch (decision.kind) {
+      case "plan":
+        return this.decidePlan(taskId, action === "approve" ? "approved" : "rejected", by, note, decisionId);
+      case "gate":
+        // decision.gate is always set for a "gate" kind decision — see derivePendingDecision.
+        return this.decideGate(taskId, decision.gate!, action === "approve" ? "approved" : "rejected", by, note, decisionId);
+      case "verification_approval":
+        // checkId's presence and membership in decision.checks were just confirmed by validateDecisionRequest.
+        return (await this.approveVerificationCommand(taskId, checkId!, by, note, decisionId)).task;
+      case "resume":
+      case "blocked":
+        return this.resume(taskId, by, decisionId);
+      case "retry":
+        return this.retry(taskId, by, note, decisionId);
+    }
   }
 
   async pause(taskId: string, by: string): Promise<TaskRecord> {
@@ -701,9 +844,10 @@ export class Orchestrator {
     });
   }
 
-  async resume(taskId: string, by: string): Promise<TaskRecord> {
+  async resume(taskId: string, by: string, expectedDecisionId?: string): Promise<TaskRecord> {
     return this.withTaskLock(taskId, async () => {
       let task = await this.deps.taskStore.requireTask(taskId);
+      await this.assertExpectedDecision(task, expectedDecisionId);
       if (task.pendingGate) {
         throw new Error(`Task "${taskId}" is paused on the "${task.pendingGate}" approval gate; use decideGate(), not resume().`);
       }
@@ -713,17 +857,19 @@ export class Orchestrator {
   }
 
   /** Recovers a FAILED task back to whatever state it failed from (e.g. after a transient provider error). Itself iteration-guarded — see WorkflowEngine. */
-  async retry(taskId: string, by: string, note?: string): Promise<TaskRecord> {
+  async retry(taskId: string, by: string, note?: string, expectedDecisionId?: string): Promise<TaskRecord> {
     return this.withTaskLock(taskId, async () => {
       let task = await this.deps.taskStore.requireTask(taskId);
+      await this.assertExpectedDecision(task, expectedDecisionId);
       task = this.deps.workflow.apply(task, "retry", "human", this.attribute(by, note));
       return this.persist(task);
     });
   }
 
-  async cancel(taskId: string, by: string, note?: string): Promise<TaskRecord> {
+  async cancel(taskId: string, by: string, note?: string, expectedDecisionId?: string): Promise<TaskRecord> {
     return this.withTaskLock(taskId, async () => {
       let task = await this.deps.taskStore.requireTask(taskId);
+      await this.assertExpectedDecision(task, expectedDecisionId);
       task = this.deps.workflow.apply(task, "cancel", "human", this.attribute(by, note));
       return this.persist(task);
     });

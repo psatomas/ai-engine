@@ -32,6 +32,12 @@ export type PendingDecisionKind = "plan" | "gate" | "verification_approval" | "r
 /** What a caller may answer. Which of these are valid is decided by the workflow engine, never hardcoded per caller. */
 export type DecisionOption = "approve" | "reject" | "retry" | "resume" | "cancel";
 
+/** Every `DecisionOption`, for runtime validation of a caller-supplied value. Keep in sync with the type above. */
+export const DECISION_OPTIONS: readonly DecisionOption[] = ["approve", "reject", "retry", "resume", "cancel"];
+
+/** The exact, fixed shape of a `PendingDecision.id` — see `digest()`. A caller-supplied id outside this shape can never match a live decision. */
+export const DECISION_ID_PATTERN = /^pd1_[a-f0-9]{32}$/;
+
 export interface PendingFindingView {
   id: string;
   severity: ReviewFinding["severity"];
@@ -453,4 +459,46 @@ export function derivePendingDecision(task: TaskRecord, context: PendingDecision
     default:
       return undefined;
   }
+}
+
+/** Why a requested decision could not be applied to a live `PendingDecision`. Each is a fixed, bounded, non-leaking code. */
+export type DecisionValidationErrorCode =
+  /** No decision is pending, or its `id` no longer matches: stale, replaced, replayed, or answering the wrong task/decision entirely. */
+  | "STALE_DECISION"
+  /** `action` is not among the live decision's own `options` (e.g. "approve" when only "retry" is legal). */
+  | "ACTION_NOT_AVAILABLE"
+  /** The action is "approve" on a `verification_approval` decision, which always answers one specific check, and no `checkId` was given. */
+  | "CHECK_ID_REQUIRED"
+  /** A `checkId` was given for a `verification_approval` approval, but it does not name one of the decision's own pending checks. */
+  | "CHECK_ID_INVALID"
+  /** A `checkId` was given where the decision kind/action has no use for one — silently ignoring it would let a caller believe a check was addressed when it was not. */
+  | "CHECK_ID_NOT_APPLICABLE";
+
+/**
+ * Pure, side-effect-free validation of a requested decision against a live `PendingDecision`
+ * snapshot: does the id still match, is the action currently legal, and — for a verification
+ * approval — does `checkId` name one of the checks this exact decision is about. `undefined`
+ * means the request may proceed; every other case names the one reason it may not.
+ *
+ * This is the ONE place that logic lives, so both an MCP-style caller (a fast, best-effort
+ * preflight before committing to anything) and the orchestrator (the authoritative check, run
+ * again against a freshly reloaded decision under the task's lock, immediately before applying)
+ * agree on exactly what "still valid" means — neither reimplements it.
+ */
+export function validateDecisionRequest(
+  decision: PendingDecision | undefined,
+  decisionId: string,
+  action: DecisionOption,
+  checkId: string | undefined
+): DecisionValidationErrorCode | undefined {
+  if (!decision || decision.id !== decisionId) return "STALE_DECISION";
+  if (!decision.options.includes(action)) return "ACTION_NOT_AVAILABLE";
+  const needsCheck = decision.kind === "verification_approval" && action === "approve";
+  if (needsCheck) {
+    if (checkId === undefined) return "CHECK_ID_REQUIRED";
+    if (!decision.checks?.some((check) => check.id === checkId)) return "CHECK_ID_INVALID";
+  } else if (checkId !== undefined) {
+    return "CHECK_ID_NOT_APPLICABLE";
+  }
+  return undefined;
 }
