@@ -52,6 +52,24 @@ import {
 
 const DIFF_CONTEXT_MAX_CHARS = 40_000;
 
+/**
+ * The workflow states from which `run()` would next invoke one of the six divergence-checked
+ * methods (`analyze/implement/test/review/fix/finalVerify` — see each one's own
+ * `loadAndCheckDivergence` call, and `run()`'s own switch). `computeDecision` only asks
+ * `checkDivergence` when the task is in one of these — a terminal or approval-gated task's
+ * worktree changing is not something any pending step would ever act on, so surfacing it as a
+ * decision there would be noise, not a real recovery need.
+ */
+const DIVERGENCE_CHECKED_STATES = new Set<WorkflowState>([
+  "TASK_CREATED",
+  "ANALYZING",
+  "IMPLEMENTING",
+  "TESTING",
+  "REVIEWING",
+  "FIXING",
+  "VERIFYING"
+]);
+
 function truncate(text: string, max: number): string {
   return text.length > max ? text.slice(0, max) + "\n...[truncated]" : text;
 }
@@ -759,10 +777,12 @@ export class Orchestrator {
    *  loaded `task` under the task lock (to revalidate immediately before applying a decision to it)
    *  computes the live decision from that SAME loaded record, not a second, potentially different read. */
   private async computeDecision(task: TaskRecord): Promise<PendingDecision | undefined> {
+    const divergedCommit = DIVERGENCE_CHECKED_STATES.has(task.workflowState) ? await this.checkDivergence(task) : undefined;
     const checks = requiresCheckLookup(task) ? await this.listVerificationChecks(task.id) : undefined;
     return derivePendingDecision(task, {
       canApply: (trigger, from) => this.deps.workflow.canApply(from ? { ...task, workflowState: from } : task, trigger),
-      checks
+      checks,
+      divergedCommit
     });
   }
 
@@ -833,6 +853,8 @@ export class Orchestrator {
         return this.resume(taskId, by, decisionId);
       case "retry":
         return this.retry(taskId, by, note, decisionId);
+      case "divergence":
+        return this.acknowledgeDivergence(taskId, by, note, decisionId);
     }
   }
 
@@ -883,9 +905,10 @@ export class Orchestrator {
    * keeping (in which case just acknowledge and continue) or should be
    * discarded (reset the worktree by hand first).
    */
-  async acknowledgeDivergence(taskId: string, by: string, note?: string): Promise<TaskRecord> {
+  async acknowledgeDivergence(taskId: string, by: string, note?: string, expectedDecisionId?: string): Promise<TaskRecord> {
     return this.withTaskLock(taskId, async () => {
       let task = await this.deps.taskStore.requireTask(taskId);
+      await this.assertExpectedDecision(task, expectedDecisionId);
       const cwd = task.git.worktreePath ?? task.workspaceFolder;
       const actual = await this.deps.gitRepo.currentCommit(cwd);
       const at = new Date().toISOString();
@@ -1029,19 +1052,30 @@ export class Orchestrator {
     return this.deps.taskStore.withLock(taskId, fn);
   }
 
-  private async loadAndCheckDivergence(taskId: string): Promise<TaskRecord> {
-    const task = await this.deps.taskStore.requireTask(taskId);
-    if (!task.git.lastKnownCommit) return task;
+  /**
+   * The one place a task's worktree commit is compared against its persisted baseline. Returns the
+   * actual current commit when it differs from `task.git.lastKnownCommit`, `undefined` otherwise
+   * (no baseline yet, worktree missing, or genuinely not diverged). No throw, no state-based
+   * gating — `loadAndCheckDivergence` (throws, for the six mutating steps) and `computeDecision`
+   * (surfaces it as a pending decision, gated to the states where a next step would reach that
+   * throw) both call this and only this, so there is exactly one divergence comparison, never two.
+   */
+  private async checkDivergence(task: TaskRecord): Promise<string | undefined> {
+    if (!task.git.lastKnownCommit) return undefined;
     const cwd = task.git.worktreePath ?? task.workspaceFolder;
     let actual: string;
     try {
       actual = await this.deps.gitRepo.currentCommit(cwd);
     } catch {
-      return task; // worktree missing entirely is a different failure mode; let the step itself surface it
+      return undefined; // worktree missing entirely is a different failure mode; let the step itself surface it
     }
-    if (actual !== task.git.lastKnownCommit) {
-      throw new GitStateDivergedError(taskId, task.git.lastKnownCommit, actual);
-    }
+    return actual !== task.git.lastKnownCommit ? actual : undefined;
+  }
+
+  private async loadAndCheckDivergence(taskId: string): Promise<TaskRecord> {
+    const task = await this.deps.taskStore.requireTask(taskId);
+    const actual = await this.checkDivergence(task);
+    if (actual !== undefined) throw new GitStateDivergedError(taskId, task.git.lastKnownCommit!, actual);
     return task;
   }
 

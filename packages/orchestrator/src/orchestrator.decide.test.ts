@@ -237,6 +237,99 @@ describe("Orchestrator.applyDecision — mapping actions onto the real APIs", ()
   });
 });
 
+/** An out-of-band commit in the task's own worktree — nobody told the task store about it, exactly H4's own technique. */
+async function outOfBandCommit(worktree: string, filename: string, message: string): Promise<void> {
+  writeFileSync(join(worktree, filename), "diverged\n");
+  const wtGit = simpleGit(worktree);
+  await wtGit.add(".");
+  await wtGit.commit(message);
+}
+
+describe("Orchestrator.applyDecision — git-state divergence is a real pending decision (Issue #9)", () => {
+  it("B. a genuinely diverged task produces a divergence decision with the right shape, and none before divergence", async () => {
+    const orchestrator = await build(new MockProvider("mock", happyResponder));
+    const created = await orchestrator.createTask("Add a feature");
+    expect(created.workflowState).toBe("TASK_CREATED");
+    expect(await orchestrator.pendingDecision(created.id)).toBeUndefined(); // no decision before divergence
+
+    const worktree = created.git.worktreePath!;
+    writeFileSync(join(worktree, "out-of-band.txt"), "diverged\n");
+    const wtGit = simpleGit(worktree);
+    await wtGit.add(".");
+    await wtGit.commit("out-of-band commit the orchestrator never recorded");
+
+    const decision = (await orchestrator.pendingDecision(created.id))!;
+    expect(decision.kind).toBe("divergence");
+    expect(decision.options).toEqual(["approve", "cancel"]);
+    expect(decision.id).toMatch(/^pd1_[a-f0-9]{32}$/);
+    expect(decision.divergence?.expectedCommit).toBe(created.git.lastKnownCommit);
+    expect(decision.divergence?.actualCommit).not.toBe(created.git.lastKnownCommit);
+    expect(decision.untrusted).toEqual([]); // commit hashes only — nothing repository-authored
+
+    const applied = await orchestrator.applyDecision(created.id, decision.id, "approve", { by: "tester" });
+    // The decision disappears once acknowledged — the task is unstuck, still in TASK_CREATED, ready
+    // for a normal next step (analyze), not a new pending decision.
+    expect(applied.workflowState).toBe("TASK_CREATED");
+    expect(await orchestrator.pendingDecision(created.id)).toBeUndefined();
+  });
+
+  it("C. approve routes through the real acknowledgeDivergence(), updating the real git baseline — not a mock or a duplicated transition", async () => {
+    const orchestrator = await build(new MockProvider("mock", happyResponder));
+    const created = await orchestrator.createTask("Add a feature");
+    const worktree = created.git.worktreePath!;
+    await outOfBandCommit(worktree, "out-of-band.txt", "out-of-band commit");
+    const wtGit = simpleGit(worktree);
+    const actualCommit = (await wtGit.revparse(["HEAD"])).trim();
+
+    const decision = (await orchestrator.pendingDecision(created.id))!;
+    const applied = await orchestrator.applyDecision(created.id, decision.id, "approve", { by: "tester", note: "reviewed, keeping it" });
+
+    // The real acknowledgeDivergence() behavior: baseline updated to the actual commit, a
+    // DIVERGENCE_ACKNOWLEDGED failure-log entry recorded, workflowState untouched.
+    expect(applied.git.lastKnownCommit).toBe(actualCommit);
+    expect(applied.failures.at(-1)).toMatchObject({ code: "DIVERGENCE_ACKNOWLEDGED" });
+    expect(applied.workflowState).toBe("TASK_CREATED");
+    // And the task genuinely proceeds normally afterward — not a permanently special state.
+    const analyzed = await orchestrator.analyze(created.id);
+    expect(analyzed.workflowState).not.toBe("FAILED");
+  });
+
+  it("D. cancel on a diverged task uses the existing cancel() path, exactly like every other decision kind", async () => {
+    const orchestrator = await build(new MockProvider("mock", happyResponder));
+    const created = await orchestrator.createTask("Add a feature");
+    await outOfBandCommit(created.git.worktreePath!, "out-of-band.txt", "out-of-band commit");
+    const decision = (await orchestrator.pendingDecision(created.id))!;
+    expect(decision.options).toContain("cancel");
+
+    const applied = await orchestrator.applyDecision(created.id, decision.id, "cancel", { by: "tester" });
+    expect(applied.workflowState).toBe("CANCELLED");
+  });
+
+  it("E. a stale divergence decisionId cannot acknowledge a newer divergence state", async () => {
+    const orchestrator = await build(new MockProvider("mock", happyResponder));
+    const created = await orchestrator.createTask("Add a feature");
+    const worktree = created.git.worktreePath!;
+    await outOfBandCommit(worktree, "first.txt", "first out-of-band commit");
+    const stale = (await orchestrator.pendingDecision(created.id))!;
+
+    // The repository state changes again before the stale decision is ever answered.
+    await outOfBandCommit(worktree, "second.txt", "second out-of-band commit");
+    const live = (await orchestrator.pendingDecision(created.id))!;
+    expect(live.id).not.toBe(stale.id); // a materially different divergence, a different id
+    expect(live.divergence?.actualCommit).not.toBe(stale.divergence?.actualCommit);
+
+    await expect(orchestrator.applyDecision(created.id, stale.id, "approve", { by: "tester" })).rejects.toMatchObject({
+      code: "STALE_DECISION"
+    });
+    // Fails closed: the baseline was never touched by the rejected, stale attempt.
+    expect((await orchestrator.getTask(created.id))!.git.lastKnownCommit).toBe(created.git.lastKnownCommit);
+
+    // The live one still works normally.
+    const applied = await orchestrator.applyDecision(created.id, live.id, "approve", { by: "tester" });
+    expect(applied.git.lastKnownCommit).toBe(live.divergence?.actualCommit);
+  });
+});
+
 describe("Orchestrator.applyDecision — validation", () => {
   it("refuses an action absent from the live decision's own options", async () => {
     const provider = new MockProvider("mock", (request) =>

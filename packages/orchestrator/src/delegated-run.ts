@@ -11,6 +11,7 @@ import {
   createOrchestrator,
   DecisionApplicationError,
   DirtyWorkingTreeError,
+  GitStateDivergedError,
   requireCleanTaskTree,
   type Orchestrator
 } from "./orchestrator.js";
@@ -55,7 +56,8 @@ export interface SubmissionActivity {
     | "ACTION_NOT_AVAILABLE"
     | "CHECK_ID_REQUIRED"
     | "CHECK_ID_INVALID"
-    | "CHECK_ID_NOT_APPLICABLE";
+    | "CHECK_ID_NOT_APPLICABLE"
+    | "GIT_STATE_DIVERGED";
 }
 
 /** The bounded result of `DelegatedRunStore.releaseStale()` — never a thrown exception for the ordinary "nothing to do" or "refused" cases. */
@@ -194,7 +196,8 @@ export class DelegatedRunStore {
             "ACTION_NOT_AVAILABLE",
             "CHECK_ID_REQUIRED",
             "CHECK_ID_INVALID",
-            "CHECK_ID_NOT_APPLICABLE"
+            "CHECK_ID_NOT_APPLICABLE",
+            "GIT_STATE_DIVERGED"
           ].includes(value.error))
       ) {
         throw new Error("INVALID_RUN_RECORD");
@@ -453,6 +456,7 @@ export const DELEGATED_DECISION_ACTOR = "ai-engine-mcp";
 
 function classifyRunError(error: unknown, kind: DelegatedIntent["kind"], running: boolean): SubmissionActivity["error"] {
   if (error instanceof DirtyWorkingTreeError) return "DIRTY_WORKING_TREE";
+  if (error instanceof GitStateDivergedError) return "GIT_STATE_DIVERGED";
   if (error instanceof DecisionApplicationError) return error.code;
   if (running) return "EXECUTION_FAILED";
   return kind === "submission" ? "TASK_CREATION_FAILED" : "DECISION_APPLICATION_FAILED";

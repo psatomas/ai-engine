@@ -5,6 +5,7 @@ import type {
   PendingDecision,
   PendingDecisionKind,
   PendingDecisionProvenance,
+  PendingDivergenceView,
   PendingFailureView,
   PendingFindingView,
   PendingReviewView
@@ -469,6 +470,15 @@ function projectDecision(decision: PendingDecision, L: Limits, acc: Clipped): De
       }
     : undefined;
 
+  // Commit hashes only — fixed-length, orchestrator-derived, never repository-authored text — so a
+  // plain ident() bound is correct here exactly as it is for `gate`/`previousState` below.
+  const divergence: PendingDivergenceView | undefined = decision.divergence
+    ? {
+        expectedCommit: ident(decision.divergence.expectedCommit, L.ident, acc, relevant),
+        actualCommit: ident(decision.divergence.actualCommit, L.ident, acc, relevant)
+      }
+    : undefined;
+
   const projected: DecisionView = {
     taskId: ident(decision.taskId, L.ident, acc, relevant),
     kind: decision.kind,
@@ -485,7 +495,8 @@ function projectDecision(decision: PendingDecision, L: Limits, acc: Clipped): De
     ...(checks ? { checks } : {}),
     ...(checksCut ? { totalChecks: decision.checks!.length } : {}),
     ...(failure ? { failure } : {}),
-    ...(decision.previousState !== undefined ? { previousState: ident(decision.previousState, L.ident, acc) } : {})
+    ...(decision.previousState !== undefined ? { previousState: ident(decision.previousState, L.ident, acc) } : {}),
+    ...(divergence ? { divergence } : {})
   };
 
   // Unit 1's reason, when it has one, always stands; otherwise approval is withheld only if it WAS on offer.
