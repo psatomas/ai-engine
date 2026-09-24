@@ -6,38 +6,111 @@
   "publisher": "ai-engine-local",
   "private": true,
   "type": "commonjs",
-  "engines": { "vscode": "^1.90.0" },
-  "categories": ["Other"],
-  "activationEvents": ["onStartupFinished"],
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
-      { "command": "aiEngine.newTask", "title": "AI: New Task" },
-      { "command": "aiEngine.analyze", "title": "AI: Analyze Repository" },
-      { "command": "aiEngine.plan", "title": "AI: Plan Task" },
-      { "command": "aiEngine.approvePlan", "title": "AI: Approve Plan" },
-      { "command": "aiEngine.implement", "title": "AI: Implement Task" },
-      { "command": "aiEngine.verify", "title": "AI: Run Verification" },
-      { "command": "aiEngine.review", "title": "AI: Review Changes" },
-      { "command": "aiEngine.securityReview", "title": "AI: Security Review" },
-      { "command": "aiEngine.fix", "title": "AI: Fix Findings" },
-      { "command": "aiEngine.resume", "title": "AI: Resume Workflow" },
-      { "command": "aiEngine.retry", "title": "AI: Retry Failed Task" },
-      { "command": "aiEngine.acknowledgeDivergence", "title": "AI: Acknowledge Git State Divergence" },
-      { "command": "aiEngine.approveVerificationCommand", "title": "AI: Approve Verification Command" },
-      { "command": "aiEngine.cancel", "title": "AI: Cancel Workflow" },
-      { "command": "aiEngine.status", "title": "AI: Show Workflow Status" },
-      { "command": "aiEngine.run", "title": "AI: Run Workflow (automatic until approval needed)" },
-      { "command": "aiEngine.refresh", "title": "AI: Refresh", "icon": "$(refresh)" }
+      {
+        "command": "aiEngine.newTask",
+        "title": "AI: New Task"
+      },
+      {
+        "command": "aiEngine.analyze",
+        "title": "AI: Analyze Repository"
+      },
+      {
+        "command": "aiEngine.plan",
+        "title": "AI: Plan Task"
+      },
+      {
+        "command": "aiEngine.approvePlan",
+        "title": "AI: Approve Plan"
+      },
+      {
+        "command": "aiEngine.implement",
+        "title": "AI: Implement Task"
+      },
+      {
+        "command": "aiEngine.verify",
+        "title": "AI: Run Verification"
+      },
+      {
+        "command": "aiEngine.review",
+        "title": "AI: Review Changes"
+      },
+      {
+        "command": "aiEngine.securityReview",
+        "title": "AI: Security Review"
+      },
+      {
+        "command": "aiEngine.fix",
+        "title": "AI: Fix Findings"
+      },
+      {
+        "command": "aiEngine.resume",
+        "title": "AI: Resume Workflow"
+      },
+      {
+        "command": "aiEngine.retry",
+        "title": "AI: Retry Failed Task"
+      },
+      {
+        "command": "aiEngine.acknowledgeDivergence",
+        "title": "AI: Acknowledge Git State Divergence"
+      },
+      {
+        "command": "aiEngine.approveVerificationCommand",
+        "title": "AI: Approve Verification Command"
+      },
+      {
+        "command": "aiEngine.cancel",
+        "title": "AI: Cancel Workflow"
+      },
+      {
+        "command": "aiEngine.status",
+        "title": "AI: Show Workflow Status"
+      },
+      {
+        "command": "aiEngine.run",
+        "title": "AI: Run Workflow (automatic until approval needed)"
+      },
+      {
+        "command": "aiEngine.refresh",
+        "title": "AI: Refresh",
+        "icon": "$(refresh)"
+      }
     ],
     "viewsContainers": {
-      "activitybar": [{ "id": "aiEngine", "title": "AI Engine", "icon": "resources/icon.svg" }]
+      "activitybar": [
+        {
+          "id": "aiEngine",
+          "title": "AI Engine",
+          "icon": "resources/icon.svg"
+        }
+      ]
     },
     "views": {
       "aiEngine": [
-        { "id": "aiEngine.taskView", "name": "Task" },
-        { "id": "aiEngine.verificationView", "name": "Verification" },
-        { "id": "aiEngine.reviewView", "name": "Review Findings" }
+        {
+          "id": "aiEngine.taskView",
+          "name": "Task"
+        },
+        {
+          "id": "aiEngine.verificationView",
+          "name": "Verification"
+        },
+        {
+          "id": "aiEngine.reviewView",
+          "name": "Review Findings"
+        }
       ]
     }
   },
