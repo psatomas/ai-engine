@@ -128,12 +128,19 @@ export function registerCommands(context: vscode.ExtensionContext, state: Extens
       return;
     }
     const picked = await vscode.window.showQuickPick(
-      pending.map((c) => ({ label: c.id, description: c.command, detail: c.description })),
-      { placeHolder: "Review the exact command before approving it — this is the same gate the CLI uses" }
+      // cwd is part of what this approval authorizes (see docs/security.md) — shown alongside the
+      // command, not just the command text, so a reviewer sees the whole thing being approved.
+      pending.map((c) => ({
+        label: c.id,
+        description: c.command,
+        detail: c.cwd ? `${c.description} — cwd: ${c.cwd}` : c.description,
+        cwd: c.cwd
+      })),
+      { placeHolder: "Review the exact command and working directory before approving it — this is the same gate the CLI uses" }
     );
     if (!picked) return;
     const confirm = await vscode.window.showWarningMessage(
-      `Approve this command to run automatically for this repository from now on?\n\n${picked.description}`,
+      `Approve this command to run automatically for this repository from now on?\n\n${picked.description}${picked.cwd ? `\n\ncwd: ${picked.cwd}` : ""}`,
       { modal: true },
       "Approve"
     );
