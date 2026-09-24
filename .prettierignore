@@ -1,0 +1,5 @@
+.ai/
+dist/
+coverage/
+*.vsix
+package-lock.json
