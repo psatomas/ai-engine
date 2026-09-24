@@ -42,6 +42,31 @@ describe("formatVerificationChecks", () => {
     expect(out).toContain("ai approve-check <taskId> custom.integration");
     expect(out).not.toMatch(/ai checks .*approve/);
   });
+
+  it("shows cwd when the check has one — it's part of what a repository-configured approval authorizes", () => {
+    const check: VerificationCheck & { approved: boolean } = {
+      id: "custom.integration",
+      description: "custom integration check",
+      command: "npm run test:integration",
+      cwd: "/repo/packages/foo",
+      requiredForReady: true,
+      origin: "repository_configured",
+      approved: true
+    };
+    expect(formatVerificationChecks([check])).toContain("cwd: /repo/packages/foo");
+  });
+
+  it("omits the cwd line entirely when the check has none", () => {
+    const check: VerificationCheck & { approved: boolean } = {
+      id: "npm.root",
+      description: "npm test",
+      command: "npm test",
+      requiredForReady: true,
+      origin: "auto_detected",
+      approved: true
+    };
+    expect(formatVerificationChecks([check])).not.toContain("cwd:");
+  });
 });
 
 describe("formatTaskDetail's 'Next action' rendering", () => {

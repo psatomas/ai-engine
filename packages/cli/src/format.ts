@@ -211,7 +211,10 @@ export function formatVerificationChecks(checks: Array<VerificationCheck & { app
             ? " [approved]"
             : " [NOT APPROVED — run `ai approve-check <taskId> " + c.id + "`]"
           : "";
-      return `${c.id} (${origin}${c.requiredForReady ? ", required" : ""})${approval}\n    ${c.command}`;
+      // cwd is part of what a repository-configured approval authorizes (see docs/security.md) —
+      // shown whenever set, for auto-detected checks too, so the display is uniform either way.
+      const cwd = c.cwd ? `\n    cwd: ${c.cwd}` : "";
+      return `${c.id} (${origin}${c.requiredForReady ? ", required" : ""})${approval}\n    ${c.command}${cwd}`;
     })
     .join("\n");
 }
