@@ -68,9 +68,15 @@ async function checkContainment(cwd: string, repoRoot: string): Promise<{ ok: tr
  * orchestrator wires @ai-engine/security's CommandApprovalStore in — so
  * this package doesn't need a dependency on @ai-engine/security, and so a
  * test can substitute a trivial in-memory predicate.
+ *
+ * `cwd`/`repoRoot` are passed through raw (exactly `check.cwd` and this
+ * call's own `options.repoRoot`) — the runner does not itself know how to
+ * turn them into an approval identity; only the checker's own implementation
+ * does (see @ai-engine/security's canonicalCwd/hashCommand), so there is
+ * exactly one definition of that identity, not one per package that touches it.
  */
 export interface CommandApprovalChecker {
-  isApproved(command: string): Promise<boolean>;
+  isApproved(command: string, cwd: string | undefined, repoRoot: string | undefined): Promise<boolean>;
 }
 
 /** Optional secondary check (defense-in-depth, not the primary boundary — see docs/security.md). */
@@ -179,7 +185,7 @@ export async function runVerification(
         });
         continue;
       }
-      const approved = (await options.approvals?.isApproved(check.command)) ?? false;
+      const approved = (await options.approvals?.isApproved(check.command, check.cwd, options.repoRoot)) ?? false;
       if (!approved) {
         results.push({
           checkId: check.id,

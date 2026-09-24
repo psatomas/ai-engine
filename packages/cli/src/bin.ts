@@ -209,8 +209,10 @@ program
   .action(async (taskId: string, checkId: string, opts: { by: string; note?: string }) => {
     try {
       const orchestrator = await createOrchestrator(process.cwd());
-      const { command } = await orchestrator.approveVerificationCommand(taskId, checkId, opts.by, opts.note);
-      console.log(`Approved "${checkId}": ${command}`);
+      const { command, cwd } = await orchestrator.approveVerificationCommand(taskId, checkId, opts.by, opts.note);
+      // cwd is bound into this approval's identity (see docs/security.md) — always shown, not
+      // just when non-default, so the confirmation reflects exactly what was authorized.
+      console.log(`Approved "${checkId}": ${command}${cwd ? ` (cwd: ${cwd})` : ""}`);
     } catch (err) {
       fail(err);
     }
