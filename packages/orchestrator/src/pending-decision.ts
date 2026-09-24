@@ -27,7 +27,7 @@ export const PENDING_DECISION_LIMITS = {
 
 const ELLIPSIS = "…";
 
-export type PendingDecisionKind = "plan" | "gate" | "verification_approval" | "retry" | "blocked" | "resume";
+export type PendingDecisionKind = "plan" | "gate" | "verification_approval" | "retry" | "blocked" | "resume" | "divergence";
 
 /** What a caller may answer. Which of these are valid is decided by the workflow engine, never hardcoded per caller. */
 export type DecisionOption = "approve" | "reject" | "retry" | "resume" | "cancel";
@@ -63,6 +63,13 @@ export interface PendingCheckView {
   command: string;
   cwd?: string;
   reason?: string;
+}
+
+export interface PendingDivergenceView {
+  /** The commit the persisted task state last recorded as the worktree's baseline. */
+  expectedCommit: string;
+  /** The worktree's actual current commit — differs from `expectedCommit`, which is what makes this a pending decision. */
+  actualCommit: string;
 }
 
 export interface PendingFailureView {
@@ -121,6 +128,7 @@ export interface PendingDecision {
   checks?: PendingCheckView[];
   failure?: PendingFailureView;
   previousState?: WorkflowState;
+  divergence?: PendingDivergenceView;
 }
 
 export interface PendingDecisionContext {
@@ -135,6 +143,14 @@ export interface PendingDecisionContext {
    * Required exactly when `requiresCheckLookup(task)` is true, and otherwise ignored.
    */
   checks?: ReadonlyArray<VerificationCheck & { approved: boolean }>;
+  /**
+   * The worktree's actual current commit, supplied only when it differs from the task's persisted
+   * `git.lastKnownCommit` — computed by `Orchestrator.checkDivergence()`, the same primitive
+   * `loadAndCheckDivergence()` throws from, so there is exactly one place this comparison is made.
+   * `undefined` means either not diverged or not currently relevant to check (the caller decides
+   * when checking applies — see `Orchestrator.computeDecision`).
+   */
+  divergedCommit?: string;
 }
 
 /**
@@ -318,6 +334,27 @@ export function derivePendingDecision(task: TaskRecord, context: PendingDecision
       ...extra
     };
   };
+
+  // Checked before the workflowState switch: a genuine divergence pre-empts whatever the persisted
+  // state would otherwise imply, exactly like loadAndCheckDivergence() refuses to let a mutating
+  // step proceed regardless of which step it is. The caller (Orchestrator.computeDecision) only
+  // ever supplies `divergedCommit` for workflow states where a next step would actually reach
+  // loadAndCheckDivergence(), so this never fires for e.g. a terminal or approval-gated task.
+  if (context.divergedCommit) {
+    const expectedCommit = ident(task.git.lastKnownCommit ?? "", acc, false);
+    const actualCommit = ident(context.divergedCommit, acc, false);
+    return finish(
+      "divergence",
+      "The task's worktree no longer matches its last recorded state (commonly: a process was killed between a commit and saving task state). Review the worktree, then acknowledge to accept its current state and continue, or cancel.",
+      { expectedCommit: task.git.lastKnownCommit ?? "", actualCommit: context.divergedCommit },
+      optionsWhere([
+        ["approve", true], // acknowledging a genuine divergence is not a workflow-engine transition — always legal once detected
+        ["cancel", canApply("cancel")]
+      ]),
+      [],
+      { divergence: { expectedCommit, actualCommit } }
+    );
+  }
 
   switch (task.workflowState) {
     case "AWAITING_APPROVAL": {

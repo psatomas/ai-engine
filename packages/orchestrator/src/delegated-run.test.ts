@@ -200,6 +200,69 @@ it("failed creation is observable; unexpected execution failure keeps ownership"
   expect(await store().activity(next.taskId)).toMatchObject({ error: "EXECUTION_FAILED", phase: "FAILED" });
   await expect(store().reserve("t-next", "next")).rejects.toMatchObject({ code: "DELEGATED_RUN_EXISTS" });
 });
+it("a real git-state divergence is classified distinctly from a generic execution failure (Issue #9)", async () => {
+  // Seeded directly (mirroring the "foreign task" test below), so this needs no real provider —
+  // loadAndCheckDivergence() throws before any role would ever be invoked.
+  const { TaskStore } = await import("./task-store.js");
+  const commit = git("rev-parse", "HEAD").trim();
+  const now = new Date().toISOString();
+  const taskId = "t-diverged";
+  await new TaskStore(join(data, "tasks")).save({
+    id: taskId,
+    repository: { root: repo },
+    workspaceFolder: repo,
+    originalRequest: "Add a feature",
+    workflowState: "IMPLEMENTING",
+    agentsUsed: [],
+    git: { branch: "main", commit, worktreePath: repo, lastKnownCommit: commit, dirtyAtStart: false, untrackedAtStart: [] },
+    verification: [],
+    reviews: [],
+    approvals: [],
+    history: [],
+    failures: [],
+    iterationCounts: {},
+    createdAt: now,
+    updatedAt: now,
+    providerSessions: {},
+    usage: {},
+    roleInvocationCounts: {},
+    usageEvents: []
+  });
+  const reservation = await store().reserve(taskId, { kind: "continuation", decisionId: "pd1_" + "a".repeat(32), action: "resume" });
+  const orchestrator = await api();
+  await executeDelegatedTask(reservation.taskId, reservation.nonce, {
+    cwd: repo,
+    dataDir: data,
+    open: async () => ({
+      createTask: vi.fn(),
+      // A stub, not the real applyDecision: the out-of-band commit must land AFTER whatever
+      // "answering the decision" would itself persist (persist() auto-resyncs lastKnownCommit to
+      // whatever the worktree's current commit is, which would otherwise silently absorb it) and
+      // BEFORE run() actually reaches loadAndCheckDivergence — exactly H4's own "out-of-band
+      // commit nobody told the task store about" technique, timed to survive to that check.
+      applyDecision: async () => {
+        await writeFile(join(repo, "out-of-band.txt"), "diverged\n");
+        git("add", ".");
+        git("commit", "-qm", "out-of-band commit the orchestrator never recorded");
+        return (await orchestrator.getTask(taskId))!;
+      },
+      run: (id: string) => orchestrator.run(id)
+    })
+  });
+
+  expect(await store().activity(taskId)).toMatchObject({ phase: "FAILED", error: "GIT_STATE_DIVERGED" });
+  // Genuinely distinguishable from an ordinary EXECUTION_FAILED, not merely a different string that
+  // happens to sort differently — a caller can tell these apart.
+  const activity = await store().activity(taskId);
+  expect(activity?.error).not.toBe("EXECUTION_FAILED");
+
+  // The task remains recoverable — not a dead end — and the SAME real orchestrator now exposes the
+  // exact recovery decision through the ordinary pendingDecision() path (Issue #9's core point:
+  // this must be discoverable conversationally, not just via a bounded activity error code).
+  const recovery = (await orchestrator.pendingDecision(taskId))!;
+  expect(recovery.kind).toBe("divergence");
+  expect(recovery.options).toEqual(["approve", "cancel"]);
+});
 it("stale worker is observable but its reservation cannot be stolen", async () => {
   const reservation = await store().reserve("t-stale", "work");
   await store().update({ ...reservation, pid: 2147483647, started: true });
