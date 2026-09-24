@@ -355,7 +355,9 @@ describe("C1b: finalVerify() applies the identical approval boundary at VERIFYIN
     // human revoked it, or a different machine performs final verification) — same store, same
     // file, a fresh independent instance so this test never reaches into Orchestrator internals.
     const approvalStore = new CommandApprovalStore(join(dataDir, "approvals.json"));
-    await approvalStore.revoke(`touch "${markerFile}"`);
+    // This check's cwd was never configured, so its canonical identity is "" (the worktree root)
+    // regardless of which task's absolute worktree it actually ran in — see canonicalCwd().
+    await approvalStore.revoke(`touch "${markerFile}"`, undefined, undefined);
 
     task = await orchestrator.finalVerify(task.id);
 
@@ -365,6 +367,85 @@ describe("C1b: finalVerify() applies the identical approval boundary at VERIFYIN
     // The (costly, and ultimately pointless — its verdict would be discarded regardless) verifier
     // role invocation never happens for a pending-approval pause.
     expect(provider.invocations.filter((i) => i.role === "verifier")).toHaveLength(0);
+  });
+});
+
+describe("C1c: an approval does not survive the SAME check's configured cwd changing to a different directory (Issue #3)", () => {
+  it("proves the substitution attack is closed: approve command X at cwd A, retain X, change configured cwd to B — the old approval does not authorize execution at B", async () => {
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(join(repoDir, "package-a"), { recursive: true });
+    mkdirSync(join(repoDir, "package-b"), { recursive: true });
+    writeFileSync(join(repoDir, "package-a", ".gitkeep"), "");
+    writeFileSync(join(repoDir, "package-b", ".gitkeep"), "");
+    const git = simpleGit(repoDir);
+    await git.add(".");
+    await git.commit("add package-a and package-b");
+
+    // A minimal orchestrator, just to create the task and learn its real worktree path — every
+    // task's worktree mirrors the same committed layout, so package-a/package-b exist in it too.
+    const bootstrap = await buildOrchestrator();
+    let task = await bootstrap.createTask("Add a feature");
+    const worktree = task.git.worktreePath!;
+    const cwdA = join(worktree, "package-a");
+    const cwdB = join(worktree, "package-b");
+    const command = "touch RAN_HERE"; // same command text throughout — only cwd ever changes
+
+    const configAtCwd = (cwd: string): ProjectConfig => ({
+      name: "demo",
+      roles: {},
+      verification: {
+        additionalChecks: [
+          { id: "custom.marker", description: "runs somewhere repository-configured", command, cwd, requiredForReady: true }
+        ],
+        disable: []
+      },
+      review: { focusAreas: [], protocolSecurityReview: false },
+      writeTaskSummaries: false
+    });
+    const approvalConfig = {
+      approvals: GlobalConfigSchema.shape.approvals.parse({ plan: false, security_review: false, final_merge: true })
+    };
+
+    // Drive the SAME task to REVIEWING via an orchestrator configured for cwd A, approving there.
+    const orchestratorA = await buildOrchestrator({ projectConfig: configAtCwd(cwdA), configOverrides: approvalConfig });
+    task = await orchestratorA.run(task.id); // plan auto-approved by config -> drives straight to the TESTING pause
+    expect(task.workflowState).toBe("PAUSED"); // NOT_APPROVED at cwd A — nothing has run yet
+    await orchestratorA.approveVerificationCommand(task.id, "custom.marker", "alice", "reviewed at package-a");
+    task = await orchestratorA.resume(task.id, "alice");
+    task = await orchestratorA.test(task.id);
+    expect(task.verification.at(-1)?.results.find((r) => r.checkId === "custom.marker")?.status).toBe("PASS");
+    task = await orchestratorA.review(task.id); // security_review disabled -> straight to VERIFYING
+    expect(task.workflowState).toBe("VERIFYING");
+
+    const fs = await import("node:fs/promises");
+    await expect(fs.access(join(cwdA, "RAN_HERE"))).resolves.toBeUndefined(); // it genuinely ran, at A
+    await expect(fs.access(join(cwdB, "RAN_HERE"))).rejects.toThrow(); // never at B
+
+    // The repository's configuration changes: the SAME check id and command, but cwd now points at
+    // B — exactly the reproduction from the investigation. No new approval is granted anywhere.
+    const orchestratorB = await buildOrchestrator({ projectConfig: configAtCwd(cwdB), configOverrides: approvalConfig });
+    task = await orchestratorB.finalVerify(task.id);
+
+    // The old approval (granted for A) must not authorize this — same pause behavior as C1b, not a
+    // silent PASS and not a route into FIXING.
+    expect(task.workflowState).toBe("PAUSED");
+    expect(task.workflowState).not.toBe("FIXING");
+    expect(task.verification.at(-1)?.results.find((r) => r.checkId === "custom.marker")?.status).toBe("NOT_APPROVED");
+    const checks = await orchestratorB.listVerificationChecks(task.id);
+    expect(checks.find((c) => c.id === "custom.marker")?.approved).toBe(false);
+
+    // The proof: it never actually executed at B under the stale approval.
+    await expect(fs.access(join(cwdB, "RAN_HERE"))).rejects.toThrow();
+    // The original run at A is untouched.
+    await expect(fs.access(join(cwdA, "RAN_HERE"))).resolves.toBeUndefined();
+
+    // A fresh, explicit approval at B is still possible and still works normally.
+    await orchestratorB.approveVerificationCommand(task.id, "custom.marker", "alice", "reviewed at package-b too");
+    task = await orchestratorB.resume(task.id, "alice");
+    expect(task.workflowState).toBe("VERIFYING");
+    task = await orchestratorB.finalVerify(task.id);
+    expect(task.verification.at(-1)?.results.find((r) => r.checkId === "custom.marker")?.status).toBe("PASS");
+    await expect(fs.access(join(cwdB, "RAN_HERE"))).resolves.toBeUndefined();
   });
 });
 

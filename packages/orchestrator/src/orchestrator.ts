@@ -444,7 +444,7 @@ export class Orchestrator {
         // through `tests_failed` -> FIXING -> (fixer can't do anything) -> ... -> BLOCKED was too
         // late: by the time any caller could react, a test_fix iteration was already spent and
         // the fixer had already been invoked for something it has no authority to resolve.
-        const awaiting = await this.requiredChecksAwaitingApproval(report, allChecks);
+        const awaiting = await this.requiredChecksAwaitingApproval(report, allChecks, cwd);
         if (awaiting.length > 0) {
           task = this.deps.workflow.apply(
             task,
@@ -654,7 +654,7 @@ export class Orchestrator {
         // failure, and must stop here — before the (costly, and ultimately pointless — its
         // verdict would be discarded regardless) verifier role invocation below, let alone
         // `verified_fail` -> FIXING.
-        const awaiting = await this.requiredChecksAwaitingApproval(report, allChecks);
+        const awaiting = await this.requiredChecksAwaitingApproval(report, allChecks, cwd);
         if (awaiting.length > 0) {
           task = this.deps.workflow.apply(
             task,
@@ -695,14 +695,14 @@ export class Orchestrator {
     });
   }
 
-  /** Explicitly approves a repository-configured verification command (see docs/security.md#c1). CLI and VS Code both call this — there is exactly one approval mechanism. */
+  /** Explicitly approves a repository-configured verification command at its exact current (command, cwd) — see docs/security.md#c1. CLI and VS Code both call this — there is exactly one approval mechanism. */
   async approveVerificationCommand(
     taskId: string,
     checkId: string,
     by: string,
     note?: string,
     expectedDecisionId?: string
-  ): Promise<{ task: TaskRecord; command: string }> {
+  ): Promise<{ task: TaskRecord; command: string; cwd?: string }> {
     return this.withTaskLock(taskId, async () => {
       let task = await this.deps.taskStore.requireTask(taskId);
       await this.assertExpectedDecision(task, expectedDecisionId);
@@ -716,13 +716,13 @@ export class Orchestrator {
       if (check.origin !== "repository_configured") {
         throw new Error(`Check "${checkId}" is auto-detected, not repository-configured, and never requires approval.`);
       }
-      await this.deps.commandApprovalStore.approve(check.command, by);
+      await this.deps.commandApprovalStore.approve(check.command, check.cwd, cwd, by);
       task = {
         ...task,
         approvals: [...task.approvals, { gate: `verification:${checkId}`, decision: "approved", by, at: new Date().toISOString(), note }]
       };
       task = await this.persist(task);
-      return { task, command: check.command };
+      return { task, command: check.command, cwd: check.cwd };
     });
   }
 
@@ -735,7 +735,7 @@ export class Orchestrator {
     return Promise.all(
       allChecks.map(async (c) => ({
         ...c,
-        approved: c.origin === "repository_configured" ? await this.deps.commandApprovalStore.isApproved(c.command) : true
+        approved: c.origin === "repository_configured" ? await this.deps.commandApprovalStore.isApproved(c.command, c.cwd, cwd) : true
       }))
     );
   }
@@ -1108,13 +1108,17 @@ export class Orchestrator {
    * what stops an already-approved check from ever being flagged a second time (see guided.ts's
    * matching fix in its own, independent detection layer).
    */
-  private async requiredChecksAwaitingApproval(report: VerificationReport, checks: VerificationCheck[]): Promise<string[]> {
+  private async requiredChecksAwaitingApproval(
+    report: VerificationReport,
+    checks: VerificationCheck[],
+    repoRoot: string
+  ): Promise<string[]> {
     const requiredIds = new Set(checks.filter((c) => c.requiredForReady).map((c) => c.id));
     const awaiting: string[] = [];
     for (const r of report.results) {
       if (r.status !== "NOT_APPROVED" || !requiredIds.has(r.checkId)) continue;
       const check = checks.find((c) => c.id === r.checkId);
-      if (check && !(await this.deps.commandApprovalStore.isApproved(check.command))) awaiting.push(r.checkId);
+      if (check && !(await this.deps.commandApprovalStore.isApproved(check.command, check.cwd, repoRoot))) awaiting.push(r.checkId);
     }
     return awaiting;
   }
