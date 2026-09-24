@@ -83,9 +83,15 @@ command executed automatically and unconditionally the first time anyone ran `ai
 `ai run`. That is now gated by an explicit, machine-local approval store:
 
 - `@ai-engine/security`'s `CommandApprovalStore` (`packages/security/src/command-approval.ts`) records
-  approvals keyed by a SHA-256 hash of the **exact command text**, in a file under the global data
-  directory (`<dataDir>/approvals/<repo-hash>.json`) — never git-tracked, so a malicious PR cannot also
-  grant itself approval.
+  approvals keyed by a SHA-256 hash of the **exact command text and the exact working directory it
+  runs in** — `cwd` is execution-relevant (a different `package.json`, config, or relative-path file
+  per directory), so an approval binds both, not the command text alone. The `cwd` half of that
+  identity is the check's _canonical, repository-relative_ location (`canonicalCwd()`), not an
+  absolute path — a single approval stays valid across every future task for the same repository
+  even though each task gets its own, transient, absolute worktree path; it does not survive the
+  check's _configured_ `cwd` actually changing. The record lives in a file under the global data
+  directory (`<dataDir>/approvals/<repo-hash>.json`) — never git-tracked, so a malicious PR cannot
+  also grant itself approval.
 - `@ai-engine/verification`'s `runVerification()` checks this store (plus, as a secondary floor, the
   same command deny-list used elsewhere — an approved-but-denylisted command is still refused, e.g.
   `git push --force`) before ever executing a check whose `origin` is `"repository_configured"`. An

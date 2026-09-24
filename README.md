@@ -310,11 +310,6 @@ limitation, and what's explicitly out of scope.
   UI behavior (tree views, command palette). See [docs/vscode.md](./docs/vscode.md).
 - **Only Codex and Claude Code are implemented.** Adding a third provider is intentionally small —
   see [§15](#15-how-to-add-a-future-provider-eg-gemini).
-- **The verification-command approval UI doesn't show `cwd`.** A second independent audit found that
-  `ai checks`/the VS Code approval prompt display a repository-configured check's `command` but not
-  its `cwd`, which is unvalidated and can be set to anywhere on disk — a reviewer approving based on
-  what they're shown wouldn't see that. Not yet fixed; treat the approval gate's information as
-  incomplete until this is addressed.
 - **The verification-command approval gate is scoped to AI Engine's own automated verification
   step**, not a comprehensive guarantee that no repository-configured command can ever execute — an
   implementer/fixer role already has real shell access inside its worktree and could in principle
