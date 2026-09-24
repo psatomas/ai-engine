@@ -1,6 +1,6 @@
 import { execa } from "execa";
 import { realpath } from "node:fs/promises";
-import { isAbsolute, relative } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import type { VerificationCheck, VerificationReport, VerificationResult } from "@ai-engine/core";
 import type { NotConfiguredCheck } from "./detectors.js";
 
@@ -15,6 +15,19 @@ const OUTPUT_TAIL_CHARS = 8000;
  * directory `Dirent.isDirectory()` saw as real at discovery time could have been
  * replaced by a symlink pointing outside the repository by the time this actually
  * runs.
+ *
+ * A relative `cwd` is resolved against `repoRoot` first — never left for `realpath`
+ * to resolve on its own, which would instead anchor it to this *process's* own OS
+ * working directory. That base is unrelated to, and in real usage never equal to, the
+ * task's own worktree: the CLI runs from wherever the operator invoked it, the VS
+ * Code extension host has its own unrelated cwd, and a delegated worker is launched
+ * with the original repository checkout as its cwd, never the task's dedicated
+ * worktree. Anchoring to `repoRoot` first makes a relative `cwd` (e.g. "packages/foo",
+ * or "." for the root itself) mean the same directory every time, regardless of where
+ * this process happens to be running from — matching the same repository-relative
+ * interpretation `canonicalCwd` (`@ai-engine/security`) already uses for approval
+ * identity. An absolute `cwd` is unaffected: `resolve(repoRoot, cwd)` returns it
+ * unchanged.
  *
  * Returns the resolved `realCwd` on success — a first review of this exact check
  * found that computing it here and then still executing with the original, unresolved
@@ -46,10 +59,11 @@ const OUTPUT_TAIL_CHARS = 8000;
  *     races.
  */
 async function checkContainment(cwd: string, repoRoot: string): Promise<{ ok: true; realCwd: string } | { ok: false; reason: string }> {
+  const anchoredCwd = resolve(repoRoot, cwd);
   let realCwd: string;
   let realRoot: string;
   try {
-    [realCwd, realRoot] = await Promise.all([realpath(cwd), realpath(repoRoot)]);
+    [realCwd, realRoot] = await Promise.all([realpath(anchoredCwd), realpath(repoRoot)]);
   } catch (err) {
     return { ok: false, reason: `check cwd could not be resolved: ${err instanceof Error ? err.message : String(err)}` };
   }

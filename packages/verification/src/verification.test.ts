@@ -1,6 +1,6 @@
 import { access, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { VerificationCheck } from "@ai-engine/core";
 import { detectChecks } from "./detectors.js";
@@ -510,6 +510,128 @@ describe("runVerification", () => {
       } finally {
         await rm(outside, { recursive: true, force: true });
       }
+    });
+
+    /**
+     * Regression for Issue #5: a relative `cwd` used to reach `realpath()` unresolved, which Node
+     * anchors to this *process's* own OS cwd — unrelated to, and in real usage never equal to, the
+     * task's own repository/worktree root. `checkContainment` now resolves a relative `cwd` against
+     * `repoRoot` first. These tests deliberately run with `process.cwd()` pointed somewhere entirely
+     * unrelated to `repoRoot`, proving resolution no longer depends on it.
+     */
+    describe("a relative cwd is resolved against repoRoot, never this process's own OS cwd", () => {
+      let scratchParent: string;
+      let unrelatedProcessCwd: string;
+      let savedProcessCwd: string;
+
+      beforeEach(async () => {
+        // A self-contained scratch area: unrelatedProcessCwd lives one level inside it, so a
+        // relative "../something" from unrelatedProcessCwd lands inside scratchParent — never in
+        // the real system tmpdir root — keeping these tests fully isolated and safe to clean up.
+        scratchParent = await mkdtemp(join(tmpdir(), "ai-engine-cwd-resolution-"));
+        unrelatedProcessCwd = join(scratchParent, "process-cwd");
+        await mkdir(unrelatedProcessCwd);
+        savedProcessCwd = process.cwd();
+        process.chdir(unrelatedProcessCwd);
+      });
+
+      afterEach(async () => {
+        // Restored even if an assertion above throws, so a failure here can never leak into later tests.
+        process.chdir(savedProcessCwd);
+        await rm(scratchParent, { recursive: true, force: true });
+      });
+
+      it('"." deterministically means the repository/worktree root itself', async () => {
+        const check: VerificationCheck = {
+          id: "root.pwd",
+          description: "prints its own cwd",
+          command: "pwd",
+          cwd: ".",
+          requiredForReady: true,
+          origin: "auto_detected"
+        };
+        const report = await runVerification("task-1", [check], [], { repoRoot });
+        expect(report.results[0]?.status).toBe("PASS");
+        expect(report.results[0]?.output?.trim()).toBe(await realpath(repoRoot));
+      });
+
+      it('"packages/foo" executes inside that subdirectory of repoRoot, not of process.cwd()', async () => {
+        const intended = join(repoRoot, "packages", "foo");
+        await mkdir(intended, { recursive: true });
+        // An identically-named, but unrelated, directory at the (wrong) process-cwd base — if the
+        // defect were still present, this is what would actually run instead.
+        await mkdir(join(unrelatedProcessCwd, "packages", "foo"), { recursive: true });
+
+        const check: VerificationCheck = {
+          id: "nested.pwd",
+          description: "prints its own cwd",
+          command: "pwd",
+          cwd: "packages/foo",
+          requiredForReady: true,
+          origin: "auto_detected"
+        };
+        const report = await runVerification("task-1", [check], [], { repoRoot });
+        expect(report.results[0]?.status).toBe("PASS"); // not FAIL/"outside the repository root"
+        // Execution used the exact canonical directory containment validated — the real, resolved
+        // path under repoRoot, never the coincidentally-identically-named one under process.cwd().
+        expect(report.results[0]?.output?.trim()).toBe(await realpath(intended));
+      });
+
+      it("the same relative-cwd check produces identical results under two different process.cwd() values", async () => {
+        const intended = join(repoRoot, "packages", "foo");
+        await mkdir(intended, { recursive: true });
+        const check: VerificationCheck = {
+          id: "nested.pwd",
+          description: "prints its own cwd",
+          command: "pwd",
+          cwd: "packages/foo",
+          requiredForReady: true,
+          origin: "auto_detected"
+        };
+
+        const first = await runVerification("task-1", [check], [], { repoRoot });
+
+        const anotherUnrelatedCwd = await mkdtemp(join(tmpdir(), "ai-engine-unrelated-process-cwd-2-"));
+        try {
+          process.chdir(anotherUnrelatedCwd);
+          const second = await runVerification("task-1", [check], [], { repoRoot });
+          // durationMs is real elapsed wall-clock time, not part of the invariant being proven here.
+          expect(second.results[0]).toMatchObject({
+            checkId: first.results[0]!.checkId,
+            status: first.results[0]!.status,
+            exitCode: first.results[0]!.exitCode,
+            output: first.results[0]!.output
+          });
+        } finally {
+          await rm(anotherUnrelatedCwd, { recursive: true, force: true });
+        }
+      });
+
+      it('a relative traversal attempt ("..") still fails containment against the correct (repoRoot-anchored) base', async () => {
+        // A genuinely existing directory outside repoRoot, so this proves containment itself
+        // rejects it (not merely that realpath failed to resolve a nonexistent path). Named via
+        // mkdtemp, not a fixed literal, and cleaned up independently — matching this file's
+        // existing convention for the sibling "outside" tests above.
+        const outsideTarget = await mkdtemp(join(tmpdir(), "ai-engine-outside-"));
+        try {
+          // The relative path FROM repoRoot TO outsideTarget — exactly what an author who doesn't
+          // realize repoRoot is a dedicated worktree, not their normal working tree, might write.
+          const escapeCwd = relative(repoRoot, outsideTarget);
+          const check: VerificationCheck = {
+            id: "escape.attempt",
+            description: "attempts to escape via a relative cwd",
+            command: "exit 0",
+            cwd: escapeCwd,
+            requiredForReady: true,
+            origin: "auto_detected"
+          };
+          const report = await runVerification("task-1", [check], [], { repoRoot });
+          expect(report.results[0]?.status).toBe("FAIL");
+          expect(report.results[0]?.reason).toMatch(/outside the repository root/);
+        } finally {
+          await rm(outsideTarget, { recursive: true, force: true });
+        }
+      });
     });
   });
 
