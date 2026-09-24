@@ -3,6 +3,7 @@ import { Command, InvalidArgumentError } from "commander";
 import {
   createOrchestrator,
   initProject,
+  DelegatedRunStore,
   IllegalTaskStateError,
   EmptyRepositoryError,
   GitStateDivergedError,
@@ -13,8 +14,10 @@ import type { CapacityFreshnessPolicy } from "@ai-engine/core";
 import { resolveEnginePaths, loadGlobalConfig } from "@ai-engine/config";
 import { TaskLockedError } from "@ai-engine/security";
 import {
+  formatDelegatedRunStatus,
   formatFindings,
   formatProviderSummaries,
+  formatStaleReleaseOutcome,
   formatTaskDetail,
   formatTaskLine,
   formatTaskUsage,
@@ -341,6 +344,40 @@ program
         if (tasks.length === 0) console.log('(no tasks yet — try `ai task "<request>"`)');
         for (const t of tasks) console.log(formatTaskLine(t));
       }
+    } catch (err) {
+      fail(err);
+    }
+  });
+
+const delegatedRun = program
+  .command("delegated-run")
+  .description("Inspect and recover MCP-delegated (submit_task/decide_task) work for the current repository");
+delegatedRun
+  .command("status")
+  .description("Show this repository's current delegated-run activity, if any (read-only — never changes anything)")
+  .action(async () => {
+    try {
+      const orchestrator = await createOrchestrator(process.cwd());
+      const store = new DelegatedRunStore(orchestrator.repoRoot, resolveEnginePaths().dataDir);
+      console.log(formatDelegatedRunStatus(await store.currentActivity()));
+    } catch (err) {
+      fail(err);
+    }
+  });
+delegatedRun
+  .command("release-stale")
+  .description(
+    "Recover a delegated-run lock left behind by a worker that died before it could release ownership (a killed " +
+      "terminal, a crash, a reboot). Releases ONLY when the recorded worker is conclusively confirmed no longer " +
+      "running on this machine; a live or indeterminate (e.g. different-host) owner is always refused. Never kills " +
+      "any process — this only ever removes AI Engine's own bookkeeping of an already-dead worker. Automatic " +
+      "stale-lock stealing remains deliberately disabled; this is the explicit, human-initiated alternative."
+  )
+  .action(async () => {
+    try {
+      const orchestrator = await createOrchestrator(process.cwd());
+      const store = new DelegatedRunStore(orchestrator.repoRoot, resolveEnginePaths().dataDir);
+      console.log(formatStaleReleaseOutcome(await store.releaseStale()));
     } catch (err) {
       fail(err);
     }

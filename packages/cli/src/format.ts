@@ -8,7 +8,7 @@ import type {
   VerificationResult
 } from "@ai-engine/core";
 import { groupUsageEvents, summarizeUsageEvents } from "@ai-engine/core";
-import type { ProviderSummary } from "@ai-engine/orchestrator";
+import type { ProviderSummary, StaleReleaseOutcome, SubmissionActivity } from "@ai-engine/orchestrator";
 import { formatCapacity, USABLE_EVIDENCE_LEGEND } from "./capacity-format.js";
 import { DETAIL_MAX_CHARS, LABEL_MAX_CHARS, sanitizeDisplayText } from "./sanitize.js";
 
@@ -244,4 +244,25 @@ function verificationIcon(status: string): string {
 function truncate(text: string, max: number): string {
   const oneLine = text.replace(/\s+/g, " ").trim();
   return oneLine.length > max ? oneLine.slice(0, max - 1) + "…" : oneLine;
+}
+
+export function formatDelegatedRunStatus(activity: SubmissionActivity | undefined): string {
+  if (!activity) return "(no delegated-run activity recorded for this repository)";
+  const lines = [`task: ${activity.taskId}`, `phase: ${activity.phase}`, `worker: ${activity.worker}`];
+  if (activity.error) lines.push(`error: ${activity.error}`);
+  if (activity.worker === "stale") lines.push("the recorded worker is confirmed no longer running — see `ai delegated-run release-stale`");
+  return lines.join("\n");
+}
+
+const STALE_RELEASE_REFUSAL_TEXT: Record<Exclude<StaleReleaseOutcome, { released: true }>["reason"], string> = {
+  NO_ACTIVE_RESERVATION: "no delegated-run lock is currently held for this repository — nothing to release.",
+  OWNER_ALIVE: "the recorded worker is still running on this machine — refusing to release a live owner.",
+  OWNER_INDETERMINATE:
+    "the recorded worker's liveness could not be conclusively determined (e.g. a different host, or an unreadable process state) — refusing to guess."
+};
+
+export function formatStaleReleaseOutcome(outcome: StaleReleaseOutcome): string {
+  if (outcome.released)
+    return `Released the stale delegated-run lock for task "${outcome.taskId}". New submissions/continuations may now proceed.`;
+  return `Not released: ${STALE_RELEASE_REFUSAL_TEXT[outcome.reason]}`;
 }

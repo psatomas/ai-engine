@@ -58,6 +58,15 @@ export interface SubmissionActivity {
     | "CHECK_ID_NOT_APPLICABLE";
 }
 
+/** The bounded result of `DelegatedRunStore.releaseStale()` — never a thrown exception for the ordinary "nothing to do" or "refused" cases. */
+export type StaleReleaseOutcome =
+  | { released: true; taskId: string }
+  | {
+      released: false;
+      /** NO_ACTIVE_RESERVATION: nothing was held (already released, or never existed). OWNER_ALIVE: the recorded worker is confirmed running — never released. OWNER_INDETERMINATE: a different host, or a liveness check that could not conclusively prove death — never released. */
+      reason: "NO_ACTIVE_RESERVATION" | "OWNER_ALIVE" | "OWNER_INDETERMINATE";
+    };
+
 /**
  * What a delegated run is FOR — an explicit, persisted discriminant the worker reads to decide what
  * to do, rather than guessing from which fields happen to be present. `"submission"` is the original
@@ -252,8 +261,59 @@ export class DelegatedRunStore {
     await this.atomicWrite(this.reservationPath(record.taskId, record.nonce), record);
     await this.atomicWrite(this.currentPath(record.taskId), record);
   }
-  async release(record: RunRecord): Promise<void> {
-    if (await this.owns(record)) await rm(this.active);
+  /** Returns whether this call actually removed ownership — false if `record` no longer owned it (already released, or replaced by a newer reservation). */
+  async release(record: RunRecord): Promise<boolean> {
+    const owned = await this.owns(record);
+    if (owned) await rm(this.active);
+    return owned;
+  }
+  /**
+   * The one place a recorded worker's liveness is judged from its `host`/`pid` — both `activity()`
+   * (observation) and `releaseStale()` (recovery authorization) call this and only this, so the two
+   * can never drift into subtly different definitions of "stale". Same-host and a confirmed-absent
+   * PID (`ESRCH`) is the only "stale" outcome; anything else — a different host, a live PID, or a
+   * liveness check that failed for a reason other than "no such process" (e.g. a permission error,
+   * conceivably from PID reuse by another user's process) — is treated as "indeterminate", never as
+   * evidence of death. This never sends a signal that could affect the process: `process.kill(pid, 0)`
+   * only probes for existence.
+   */
+  private classifyLiveness(record: RunRecord): "alive" | "stale" | "indeterminate" {
+    if (record.host !== hostname()) return "indeterminate";
+    try {
+      process.kill(record.pid, 0);
+      return "alive";
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ESRCH" ? "stale" : "indeterminate";
+    }
+  }
+  /**
+   * Explicit, human-initiated recovery for a repository-wide delegated-run lock whose recorded
+   * worker `classifyLiveness` conclusively proves is dead — never a generic/unconditional release.
+   * `reserve()` itself never calls this and never auto-steals a stale reservation; this exists
+   * specifically for an operator to invoke after confirming (via `currentActivity()`) that a worker
+   * has died. Fails closed: a live, indeterminate, or already-gone owner is left untouched, and this
+   * never sends any signal to any process.
+   *
+   * TOCTOU-safe by construction: reuses `release()`'s own owns()-gated deletion (re-reads and
+   * compares the exact nonce/taskId immediately before deleting) rather than an unconditional `rm`,
+   * so a reservation that changed between this method's initial read and the delete — the only way
+   * that can happen is a *different* actor's own legitimate release, since `reserve()` cannot create
+   * a new `active.json` while one still exists — is never removed out from under its actual owner.
+   */
+  async releaseStale(): Promise<StaleReleaseOutcome> {
+    const active = await this.read(this.active);
+    if (!active) return { released: false, reason: "NO_ACTIVE_RESERVATION" };
+    // active.json itself is written once, at reserve() time, and never updated again — only
+    // currentPath is (by every update()). Its own pid/started/host can be stale, so liveness is
+    // judged from record(), exactly like activity() does; the `?? active` fallback matches
+    // activity()'s own narrow reserve()-in-progress window where currentPath isn't published yet.
+    const current = (await this.record(active.taskId)) ?? active;
+    const liveness = this.classifyLiveness(current);
+    if (liveness === "alive") return { released: false, reason: "OWNER_ALIVE" };
+    if (liveness === "indeterminate") return { released: false, reason: "OWNER_INDETERMINATE" };
+    const released = await this.release(active);
+    if (!released) return { released: false, reason: "NO_ACTIVE_RESERVATION" }; // raced away between read and release
+    return { released: true, taskId: active.taskId };
   }
   async currentActivity(): Promise<SubmissionActivity | undefined> {
     const record = (await this.read(this.active)) ?? (await this.read(join(this.dir, "latest.json")));
@@ -279,14 +339,9 @@ export class DelegatedRunStore {
     }
     let worker: SubmissionActivity["worker"];
     if (record.settled) worker = "finished";
-    else if (record.host !== hostname()) worker = "indeterminate";
     else {
-      try {
-        process.kill(record.pid, 0);
-        worker = record.started ? "active" : "starting";
-      } catch (error) {
-        worker = (error as NodeJS.ErrnoException).code === "ESRCH" ? "stale" : "indeterminate";
-      }
+      const liveness = this.classifyLiveness(record);
+      worker = liveness === "alive" ? (record.started ? "active" : "starting") : liveness;
     }
     return { taskId: id, phase: record.phase, worker, ...(record.error ? { error: record.error } : {}) };
   }

@@ -206,6 +206,83 @@ it("stale worker is observable but its reservation cannot be stolen", async () =
   expect(await store().activity(reservation.taskId)).toMatchObject({ worker: "stale" });
   await expect(store().reserve("t-next", "work")).rejects.toMatchObject({ code: "DELEGATED_RUN_EXISTS" });
 });
+
+/**
+ * Issue #7: reserve() correctly never auto-steals a stale reservation (proven above), but until now
+ * there was no way to recover one at all. releaseStale() is the explicit, human-initiated
+ * alternative — and it must classify a worker's liveness identically to activity(), since both call
+ * the same private classifyLiveness() (see delegated-run.ts). Each test below asserts activity()'s
+ * classification and releaseStale()'s outcome together, for the same record, proving there is no
+ * drift between observation and recovery authorization.
+ */
+describe("releaseStale — explicit recovery from a confirmed-dead worker's stuck reservation", () => {
+  it("1. a confirmed-dead same-host owner can be explicitly released", async () => {
+    const reservation = await store().reserve("t-dead", "work");
+    await store().update({ ...reservation, pid: 2147483647, started: true });
+    expect(await store().activity(reservation.taskId)).toMatchObject({ worker: "stale" });
+
+    const outcome = await store().releaseStale();
+    expect(outcome).toEqual({ released: true, taskId: "t-dead" });
+    // 6. successful stale release allows a subsequent reservation.
+    await expect(store().reserve("t-next", "work")).resolves.toBeDefined();
+  });
+
+  it("2. a live same-host owner cannot be released", async () => {
+    const reservation = await store().reserve("t-alive", "work");
+    await store().update({ ...reservation, pid: process.pid, started: true }); // this test process itself: genuinely alive
+    expect(await store().activity(reservation.taskId)).toMatchObject({ worker: "active" });
+
+    const outcome = await store().releaseStale();
+    expect(outcome).toEqual({ released: false, reason: "OWNER_ALIVE" });
+    await expect(store().reserve("t-next", "work")).rejects.toMatchObject({ code: "DELEGATED_RUN_EXISTS" });
+  });
+
+  it("3. a cross-host (indeterminate) owner cannot be released", async () => {
+    const reservation = await store().reserve("t-other-host", "work");
+    await store().update({ ...reservation, host: "some-other-machine", started: true });
+    expect(await store().activity(reservation.taskId)).toMatchObject({ worker: "indeterminate" });
+
+    const outcome = await store().releaseStale();
+    expect(outcome).toEqual({ released: false, reason: "OWNER_INDETERMINATE" });
+    await expect(store().reserve("t-next", "work")).rejects.toMatchObject({ code: "DELEGATED_RUN_EXISTS" });
+  });
+
+  it("4. liveness that cannot be conclusively determined (a non-ESRCH kill failure) fails closed", async () => {
+    const reservation = await store().reserve("t-eperm", "work");
+    await store().update({ ...reservation, started: true });
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+    });
+    try {
+      expect(await store().activity(reservation.taskId)).toMatchObject({ worker: "indeterminate" });
+      const outcome = await store().releaseStale();
+      expect(outcome).toEqual({ released: false, reason: "OWNER_INDETERMINATE" });
+    } finally {
+      killSpy.mockRestore();
+    }
+    await expect(store().reserve("t-next", "work")).rejects.toMatchObject({ code: "DELEGATED_RUN_EXISTS" });
+  });
+
+  it("5. no active reservation produces a clean bounded result, never a fabricated success", async () => {
+    await expect(readdir(data)).rejects.toMatchObject({ code: "ENOENT" }); // nothing reserved yet at all
+    expect(await store().releaseStale()).toEqual({ released: false, reason: "NO_ACTIVE_RESERVATION" });
+  });
+
+  it("8. release() is conditional on the exact reservation inspected — cannot remove a newer owner that has since replaced it", async () => {
+    // releaseStale() itself has no injectable gap between its own read and its release() call, but
+    // that call is exactly release()'s existing owns()-gated deletion — so this proves the guard it
+    // depends on directly: capture a since-released record, let a genuinely different, newer
+    // reservation legitimately take over, then release the stale, no-longer-current capture late.
+    const first = await store().reserve("t-first", "work");
+    await store().update({ ...first, pid: 2147483647, started: true });
+    await store().release(first); // legitimately released, e.g. by an earlier releaseStale() call
+    const second = await store().reserve("t-second", "work"); // a newer, unrelated reservation now active
+
+    const releasedAgain = await store().release(first); // the stale capture — must be a no-op
+    expect(releasedAgain).toBe(false);
+    expect(await store().owns(second)).toBe(true); // second's ownership is completely untouched
+  });
+});
 it("rejects wrong nonce and duplicate worker starts without opening the orchestrator", async () => {
   const record = await store().reserve("t-once", "work");
   const open = vi.fn();

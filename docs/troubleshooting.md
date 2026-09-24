@@ -51,6 +51,27 @@ the lock will be detected as stale and automatically reclaimed on the next attem
 minutes; there is no manual "break the lock" command in this version — if you need to force it
 immediately, the lock is a plain file at `<dataDir>/tasks/.locks/<taskId>.lock` you can delete by hand.
 
+## `submit_task`/`decide_task` (or `DELEGATED_RUN_EXISTS`) keeps failing after a worker died
+
+AI Engine allows only one delegated (MCP-submitted) run per repository at a time. If the detached
+worker handling one dies before it can hand ownership back — a killed terminal, an OS sleep/wake
+cycle, an OOM kill, a host reboot — that ownership is never automatically reclaimed, by design (see
+[security.md](./security.md#persistence--cross-process-safety)): a liveness check that turned out
+to be wrong would risk two workers touching the same repository at once, which is worse than a
+manual recovery step. Every later `submit_task`/`decide_task` for that repository fails with
+`DELEGATED_RUN_EXISTS` until it's cleared.
+
+1. **Diagnose**: `ai delegated-run status` — read-only, shows the current owner (task id, phase,
+   and worker state). `worker: stale` means AI Engine has already confirmed, on this machine, that
+   the recorded process no longer exists.
+2. **Recover**: `ai delegated-run release-stale` — only succeeds when the recorded worker is
+   confirmed dead on this machine; a live worker, or one AI Engine can't conclusively rule out (a
+   different host, or a liveness check it couldn't complete) is always refused, and nothing is ever
+   killed — this only clears AI Engine's own bookkeeping for a worker that has already died.
+
+Automatic stale-lock stealing remains deliberately disabled; this command is the explicit,
+human-initiated alternative — there is no other way to clear it in this version.
+
 ## `error: Task "..." cannot proceed: ...` (budget exceeded)
 
 The task (or one of its roles) hit a configured `budgets.maxCostUsdPerTask` or
