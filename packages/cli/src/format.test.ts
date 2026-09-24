@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { CapacityWindow, ProviderCapacityInfo, TaskRecord, UsageEvent, VerificationCheck } from "@ai-engine/core";
-import type { ProviderSummary } from "@ai-engine/orchestrator";
-import { formatProviderSummaries, formatTaskDetail, formatTaskUsage, formatVerificationChecks } from "./format.js";
+import type { ProviderSummary, StaleReleaseOutcome, SubmissionActivity } from "@ai-engine/orchestrator";
+import {
+  formatDelegatedRunStatus,
+  formatProviderSummaries,
+  formatStaleReleaseOutcome,
+  formatTaskDetail,
+  formatTaskUsage,
+  formatVerificationChecks
+} from "./format.js";
 
 function makeTask(overrides: Partial<TaskRecord>): TaskRecord {
   return {
@@ -66,6 +73,63 @@ describe("formatVerificationChecks", () => {
       approved: true
     };
     expect(formatVerificationChecks([check])).not.toContain("cwd:");
+  });
+});
+
+describe("formatDelegatedRunStatus", () => {
+  it("reports no activity clearly when nothing has ever been delegated for this repository", () => {
+    expect(formatDelegatedRunStatus(undefined)).toBe("(no delegated-run activity recorded for this repository)");
+  });
+
+  it("shows task, phase, and worker for a live run", () => {
+    const activity: SubmissionActivity = { taskId: "t-live", phase: "RUNNING", worker: "active" };
+    const out = formatDelegatedRunStatus(activity);
+    expect(out).toContain("task: t-live");
+    expect(out).toContain("phase: RUNNING");
+    expect(out).toContain("worker: active");
+  });
+
+  it("shows a settled run without implying anything is stuck", () => {
+    const activity: SubmissionActivity = { taskId: "t-done", phase: "FINISHED", worker: "finished" };
+    expect(formatDelegatedRunStatus(activity)).not.toContain("release-stale");
+  });
+
+  it("points at the recovery command specifically when the worker is stale", () => {
+    const activity: SubmissionActivity = { taskId: "t-stuck", phase: "RUNNING", worker: "stale" };
+    const out = formatDelegatedRunStatus(activity);
+    expect(out).toContain("worker: stale");
+    expect(out).toContain("ai delegated-run release-stale");
+  });
+
+  it("surfaces a settled run's error", () => {
+    const activity: SubmissionActivity = { taskId: "t-failed", phase: "FAILED", worker: "finished", error: "EXECUTION_FAILED" };
+    expect(formatDelegatedRunStatus(activity)).toContain("error: EXECUTION_FAILED");
+  });
+});
+
+describe("formatStaleReleaseOutcome", () => {
+  it("confirms a successful release and that new work may proceed", () => {
+    const outcome: StaleReleaseOutcome = { released: true, taskId: "t-recovered" };
+    const out = formatStaleReleaseOutcome(outcome);
+    expect(out).toContain("t-recovered");
+    expect(out).toMatch(/released/i);
+  });
+
+  it("explains a refusal when there is nothing to release", () => {
+    const outcome: StaleReleaseOutcome = { released: false, reason: "NO_ACTIVE_RESERVATION" };
+    expect(formatStaleReleaseOutcome(outcome)).toContain("nothing to release");
+  });
+
+  it("explains a refusal for a live owner — never implies anything was killed", () => {
+    const outcome: StaleReleaseOutcome = { released: false, reason: "OWNER_ALIVE" };
+    const out = formatStaleReleaseOutcome(outcome);
+    expect(out).toMatch(/still running/i);
+    expect(out).not.toMatch(/kill/i);
+  });
+
+  it("explains a refusal for an indeterminate (e.g. cross-host) owner", () => {
+    const outcome: StaleReleaseOutcome = { released: false, reason: "OWNER_INDETERMINATE" };
+    expect(formatStaleReleaseOutcome(outcome)).toMatch(/could not be conclusively determined/i);
   });
 });
 

@@ -91,6 +91,18 @@ ai usage <taskId>
     shown as 0. A task with no recorded invocations prints "(no recorded usage for this task)". See
     docs/providers.md#usage--capacity.
 
+ai delegated-run status
+    Show this repository's current delegated-run (submit_task/decide_task, via MCP) activity, if
+    any — task id, phase, and worker state. Read-only. See docs/troubleshooting.md if it reports a
+    worker as "stale".
+
+ai delegated-run release-stale
+    Recover a delegated-run lock left behind by a worker that died before it could release
+    ownership. Releases only when AI Engine can conclusively confirm, on this machine, that the
+    recorded worker no longer exists; a live or indeterminate (e.g. different-host) owner is always
+    refused, and this never kills any process. Automatic stale-lock stealing remains deliberately
+    disabled — this is the explicit, human-initiated alternative. See docs/troubleshooting.md.
+
 ai config path
     Print the resolved global config/data directories for this machine.
 
