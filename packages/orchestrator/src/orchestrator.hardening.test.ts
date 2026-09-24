@@ -1011,3 +1011,60 @@ describe("H6: a cumulative-usage baseline is never handed to a different provide
     });
   });
 });
+
+describe("C1d: a relative repository-configured cwd is approved and executed under the same identity (Issue #5)", () => {
+  it("approves under canonicalCwd's repository-relative identity (Issue #3), then genuinely executes inside the corresponding directory of the task's own worktree — never wherever this test process happens to be running from", async () => {
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(join(repoDir, "packages", "foo"), { recursive: true });
+    writeFileSync(join(repoDir, "packages", "foo", ".gitkeep"), "");
+    const git = simpleGit(repoDir);
+    await git.add(".");
+    await git.commit("add packages/foo");
+
+    const projectConfig: ProjectConfig = {
+      name: "demo",
+      roles: {},
+      verification: {
+        additionalChecks: [
+          {
+            id: "custom.marker",
+            description: "runs inside packages/foo",
+            // A relative cwd, exactly as a repository author would plausibly write it — this test's
+            // own process.cwd() is wherever `npm test` was invoked from (this repository's own
+            // checkout), which is never the task's worktree, so this exercises the real defect
+            // scenario without any explicit process.chdir() gymnastics.
+            command: "touch RAN_HERE",
+            cwd: "packages/foo",
+            requiredForReady: true
+          }
+        ],
+        disable: []
+      },
+      review: { focusAreas: [], protocolSecurityReview: false },
+      writeTaskSummaries: false
+    };
+    const orchestrator = await buildOrchestrator({
+      projectConfig,
+      configOverrides: { approvals: GlobalConfigSchema.shape.approvals.parse({ plan: false, security_review: false, final_merge: true }) }
+    });
+
+    let task = await orchestrator.createTask("Add a feature");
+    task = await orchestrator.run(task.id); // plan auto-approved by config -> drives straight to the TESTING pause
+    expect(task.workflowState).toBe("PAUSED"); // NOT_APPROVED — nothing has run yet
+
+    // Approval goes through canonicalCwd's repository-relative identity (Issue #3) — never the
+    // task's absolute, transient worktree path.
+    const approval = await orchestrator.approveVerificationCommand(task.id, "custom.marker", "alice", "reviewed");
+    expect(approval.cwd).toBe("packages/foo");
+
+    task = await orchestrator.resume(task.id, "alice");
+    task = await orchestrator.test(task.id);
+
+    expect(task.verification.at(-1)?.results.find((r) => r.checkId === "custom.marker")?.status).toBe("PASS");
+    // The proof: it genuinely executed inside packages/foo of THIS task's own worktree — a
+    // completely different absolute path from this test process's own cwd — not merely that
+    // containment allowed it in the abstract.
+    const fs = await import("node:fs/promises");
+    await expect(fs.access(join(task.git.worktreePath!, "packages", "foo", "RAN_HERE"))).resolves.toBeUndefined();
+  });
+});

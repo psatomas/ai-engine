@@ -26,6 +26,7 @@ export interface VerificationCheck {
   description: string;
   /** Shell command, run with cwd = repository root (or the given subdirectory). */
   command: string;
+  /** Defaults to the repository/task-worktree root. A relative value (e.g. "packages/foo", ".") is always anchored to that root — never to the AI Engine process's own OS working directory. */
   cwd?: string;
   /** If true, a FAIL (or SKIPPED/NOT_CONFIGURED/NOT_APPROVED) blocks the task from reaching READY. */
   requiredForReady: boolean;
